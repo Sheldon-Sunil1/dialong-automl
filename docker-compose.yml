@@ -1,0 +1,89 @@
+# =============================================================================
+# DiaLong-AutoML — docker-compose skeleton
+# Phase 1: foundation only.
+# Uncomment and extend service blocks as later phases are implemented.
+# =============================================================================
+
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Shared configuration
+# ---------------------------------------------------------------------------
+x-common-env: &common-env
+  DIALONG_ENV: ${DIALONG_ENV:-development}
+  DIALONG_LOG_LEVEL: ${DIALONG_LOG_LEVEL:-INFO}
+  DIALONG_SEED: ${DIALONG_SEED:-42}
+
+x-common-volumes: &common-volumes
+  - ./data:/app/data
+  - ./artifacts:/app/artifacts
+  - ./outputs:/app/outputs
+  - ./logs:/app/logs
+  - ./configs:/app/configs
+
+services:
+  # ---------------------------------------------------------------------------
+  # dialong — main application container
+  # Phase 1: runs import check only.
+  # Phase 5+: replace command with the API server.
+  # ---------------------------------------------------------------------------
+  dialong:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: dialong-automl:dev
+    container_name: dialong-automl
+    environment:
+      <<: *common-env
+    volumes: *common-volumes
+    # Override at runtime: docker-compose run dialong pytest -q
+    command: >
+      python -c "import dialong_automl;
+                 print('DiaLong-AutoML', dialong_automl.__version__, 'ready.')"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # dialong-api  [Phase 5+ placeholder — uncomment when API is implemented]
+  # ---------------------------------------------------------------------------
+  # dialong-api:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     target: app
+  #   image: dialong-automl:dev
+  #   container_name: dialong-api
+  #   ports:
+  #     - "${DIALONG_API_PORT:-8000}:8000"
+  #   environment:
+  #     <<: *common-env
+  #   volumes: *common-volumes
+  #   command: >
+  #     uvicorn dialong_automl.api.app:app
+  #     --host 0.0.0.0 --port 8000 --workers 1
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+
+  # ---------------------------------------------------------------------------
+  # optuna-db  [Phase 3+ placeholder — uncomment when Optuna studies are used]
+  # ---------------------------------------------------------------------------
+  # optuna-db:
+  #   image: postgres:16-alpine
+  #   container_name: dialong-optuna-db
+  #   environment:
+  #     POSTGRES_DB: dialong_optuna
+  #     POSTGRES_USER: ${POSTGRES_USER:-dialong}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+  #   volumes:
+  #     - optuna-pgdata:/var/lib/postgresql/data
+  #   restart: unless-stopped
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  # optuna-pgdata:   # [Phase 3+]
