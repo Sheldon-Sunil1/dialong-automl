@@ -1,0 +1,81 @@
+# =============================================================================
+# DiaLong-AutoML — demo_fast configuration
+# =============================================================================
+# Purpose : Fast end-to-end smoke test and local development.
+# Phase   : 1 (Foundation).  Later phases will extend model/optuna sections.
+# NOTE    : Values marked "[Phase N placeholder]" are reserved for future
+#           implementation.  Do NOT treat them as active functionality.
+# =============================================================================
+
+project_name: "DiaLong-AutoML"
+version: "0.1.0"
+description: "Explainable Longitudinal AutoML for Diabetes Progression Prediction"
+
+# ---------------------------------------------------------------------------
+# Filesystem paths  (relative paths are resolved from the repository root)
+# ---------------------------------------------------------------------------
+paths:
+  data_dir: "data"
+  artifacts_dir: "artifacts"
+  outputs_dir: "outputs"
+  logs_dir: "logs"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  log_to_file: false
+  log_filename: "dialong_automl.log"
+  max_bytes: 10485760   # 10 MiB
+  backup_count: 3
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+reproducibility:
+  seed: 42
+  deterministic_torch: true
+  benchmark_cudnn: false
+
+# ---------------------------------------------------------------------------
+# Model configuration  [Phase 2 placeholder]
+# ---------------------------------------------------------------------------
+model:
+  # Models enabled for the AutoML search.
+  # 'tcn' is planned but NOT yet implemented — do not add it here.
+  enabled_models:
+    - logistic_regression
+    - random_forest
+    - xgboost
+    - lightgbm
+    - gru
+  # Per-model fixed overrides (empty = let Optuna search everything)
+  hyperparameter_overrides: {}
+
+# ---------------------------------------------------------------------------
+# Optuna  [Phase 3 placeholder]
+# ---------------------------------------------------------------------------
+optuna:
+  n_trials: 10            # keep small for the fast demo preset
+  timeout_seconds: null   # null = no wall-clock limit
+  direction: "maximize"
+  metric: "roc_auc"
+  pruner: "MedianPruner"
+  sampler: "TPESampler"
+  n_jobs: 1
+  storage: null           # null = in-memory (non-persistent)
+
+# ---------------------------------------------------------------------------
+# API  [Phase 5 placeholder]
+# ---------------------------------------------------------------------------
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  workers: 1
+  title: "DiaLong-AutoML API"
+  version: "0.1.0"
+  docs_url: "/docs"
+  redoc_url: "/redoc"
