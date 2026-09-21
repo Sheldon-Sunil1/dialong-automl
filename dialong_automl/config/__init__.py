@@ -7,6 +7,17 @@ so callers can do::
 """
 
 from dialong_automl.config.loader import load_config
-from dialong_automl.config.schema import AppConfig
+from dialong_automl.config.schema import (
+    AppConfig,
+    CohortBuilderConfig,
+    SplitterConfig,
+    SyntheticDataConfig,
+)
 
-__all__ = ["load_config", "AppConfig"]
+__all__ = [
+    "load_config",
+    "AppConfig",
+    "SyntheticDataConfig",
+    "CohortBuilderConfig",
+    "SplitterConfig",
+]

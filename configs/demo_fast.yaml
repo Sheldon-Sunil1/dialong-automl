@@ -2,7 +2,7 @@
 # DiaLong-AutoML — demo_fast configuration
 # =============================================================================
 # Purpose : Fast end-to-end smoke test and local development.
-# Phase   : 1 (Foundation).  Later phases will extend model/optuna sections.
+# Phase   : 2+3 (Data generation, cohort construction, splitting).
 # NOTE    : Values marked "[Phase N placeholder]" are reserved for future
 #           implementation.  Do NOT treat them as active functionality.
 # =============================================================================
@@ -38,6 +38,45 @@ reproducibility:
   seed: 42
   deterministic_torch: true
   benchmark_cudnn: false
+
+# ---------------------------------------------------------------------------
+# Synthetic data generation  [Phase 2]
+# ---------------------------------------------------------------------------
+data:
+  patients: 500                  # demo preset — full run uses 1000+
+  min_visits: 4
+  max_visits: 6
+  min_future_visits: 2
+  max_future_visits: 4
+  min_days_between_visits: 90
+  max_days_between_visits: 240
+  missingness_rate: 0.05
+  progression_prevalence: 0.30
+  seed: 42
+  output_dir: "data/synthetic"
+
+# ---------------------------------------------------------------------------
+# Cohort construction  [Phase 3]
+# ---------------------------------------------------------------------------
+cohort:
+  mode: "future_outcome"
+  min_observation_visits: 3
+  max_observation_visits: 4
+  prediction_horizon_days: 365
+  diabetes_onset_hba1c_threshold: 6.5
+  exclude_known_diabetes_at_baseline: true
+  require_followup_after_cutoff: true
+
+# ---------------------------------------------------------------------------
+# Train/validation/test split  [Phase 3]
+# ---------------------------------------------------------------------------
+split:
+  train_size: 0.70
+  validation_size: 0.15
+  test_size: 0.15
+  random_seed: 42
+  stratify: true
+  chronological: false
 
 # ---------------------------------------------------------------------------
 # Model configuration  [Phase 2 placeholder]
