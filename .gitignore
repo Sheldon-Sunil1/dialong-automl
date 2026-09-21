@@ -67,6 +67,7 @@ logs/
 data/raw/
 data/processed/
 data/external/
+data/synthetic/
 *.csv
 *.parquet
 *.feather

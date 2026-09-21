@@ -3,6 +3,8 @@
 All fields carry defaults so the schema is usable without a YAML file
 (e.g. in unit tests).  Future phases extend the placeholder sections
 rather than replacing them.
+
+Phase 2 adds: SyntheticDataConfig, CohortConfig, SplitConfig.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +159,112 @@ class APIConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Synthetic data configuration (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class SyntheticDataConfig(BaseModel):
+    """Configuration for the synthetic longitudinal data generator."""
+
+    patients: int = Field(1000, description="Number of synthetic patients to generate.")
+    min_visits: int = Field(4, description="Minimum observation visits per patient.")
+    max_visits: int = Field(6, description="Maximum observation visits per patient.")
+    min_future_visits: int = Field(
+        2, description="Minimum future visits generated (used for outcome only)."
+    )
+    max_future_visits: int = Field(
+        4, description="Maximum future visits generated (used for outcome only)."
+    )
+    min_days_between_visits: int = Field(
+        90, description="Minimum inter-visit interval in days."
+    )
+    max_days_between_visits: int = Field(
+        240, description="Maximum inter-visit interval in days."
+    )
+    missingness_rate: float = Field(
+        0.05, description="Fraction of numeric values to set as missing."
+    )
+    progression_prevalence: float = Field(
+        0.30, description="Approximate fraction of patients who progress to diabetes."
+    )
+    seed: int = Field(42, description="Random seed for reproducible generation.")
+    output_dir: str = Field(
+        "data/synthetic", description="Output directory for generated CSV and metadata."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cohort configuration (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class CohortBuilderConfig(BaseModel):
+    """Configuration for cohort construction (Phase 3)."""
+
+    mode: str = Field(
+        "future_outcome",
+        description="Cohort mode: 'future_outcome' or 'pre_labeled'.",
+    )
+    min_observation_visits: int = Field(
+        3, description="Minimum observation visits per patient."
+    )
+    max_observation_visits: int = Field(
+        4, description="Maximum observation visits used per patient."
+    )
+    prediction_horizon_days: int = Field(
+        365, description="Days after cutoff in which future outcomes count."
+    )
+    diabetes_onset_hba1c_threshold: float = Field(
+        6.5,
+        description="HbA1c threshold (%) for future diabetes onset classification.",
+    )
+    exclude_known_diabetes_at_baseline: bool = Field(
+        True,
+        description="Exclude patients already diabetic in the observation window.",
+    )
+    require_followup_after_cutoff: bool = Field(
+        True,
+        description="Exclude patients with no future visits beyond the cutoff.",
+    )
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, v: str) -> str:
+        allowed = {"future_outcome", "pre_labeled"}
+        if v not in allowed:
+            raise ValueError(f"cohort mode must be one of {allowed}, got {v!r}")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Split configuration (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class SplitterConfig(BaseModel):
+    """Configuration for patient-level train/val/test splitting (Phase 3)."""
+
+    train_size: float = Field(0.70, description="Fraction of patients for training.")
+    validation_size: float = Field(0.15, description="Fraction for validation.")
+    test_size: float = Field(0.15, description="Fraction for testing.")
+    random_seed: int = Field(42, description="Random seed for the split.")
+    stratify: bool = Field(True, description="Stratify by patient-level target.")
+    chronological: bool = Field(
+        False,
+        description="Split in chronological order by first visit date.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_sizes(self) -> "SplitterConfig":
+        total = self.train_size + self.validation_size + self.test_size
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"train_size + validation_size + test_size must equal 1.0, got {total:.6f}."
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
 
@@ -174,6 +282,11 @@ class AppConfig(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     reproducibility: ReproducibilityConfig = Field(default_factory=ReproducibilityConfig)
+    # Phase 2/3 sections
+    data: SyntheticDataConfig = Field(default_factory=SyntheticDataConfig)
+    cohort: CohortBuilderConfig = Field(default_factory=CohortBuilderConfig)
+    split: SplitterConfig = Field(default_factory=SplitterConfig)
+    # Later phases
     model: ModelConfig = Field(default_factory=ModelConfig)
     optuna: OptunaConfig = Field(default_factory=OptunaConfig)
     api: APIConfig = Field(default_factory=APIConfig)
