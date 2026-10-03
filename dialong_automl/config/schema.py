@@ -5,6 +5,7 @@ All fields carry defaults so the schema is usable without a YAML file
 rather than replacing them.
 
 Phase 2 adds: SyntheticDataConfig, CohortConfig, SplitConfig.
+Phase 5 adds: TrainingConfig, GRUConfig, OptunaConfig (extended).
 """
 
 from __future__ import annotations
@@ -114,34 +115,89 @@ class ModelConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Optuna placeholder (Phase 3+)
+# Optuna (Phase 5 — replaces placeholder)
 # ---------------------------------------------------------------------------
 
 
 class OptunaConfig(BaseModel):
-    """Placeholder Optuna configuration — populated in later phases."""
+    """Optuna AutoML search configuration."""
 
-    n_trials: int = Field(50, description="Number of Optuna trials per model.")
+    n_trials: int = Field(5, description="Number of Optuna trials (demo default=5).")
     timeout_seconds: int | None = Field(
-        None, description="Wall-clock timeout per Optuna study (None = unlimited)."
+        None, description="Wall-clock timeout per study (None = unlimited)."
     )
     direction: str = Field("maximize", description="Optimisation direction: maximize or minimize.")
-    metric: str = Field("roc_auc", description="Primary evaluation metric for Optuna.")
+    metric: str = Field("roc_auc", description="Primary metric used for the objective.")
     pruner: str = Field(
-        "MedianPruner", description="Optuna pruner class name (MedianPruner, HyperbandPruner, …)."
+        "MedianPruner", description="Optuna pruner class name."
     )
     sampler: str = Field(
-        "TPESampler", description="Optuna sampler class name (TPESampler, CmaEsSampler, …)."
+        "TPESampler", description="Optuna sampler class name."
     )
-    n_jobs: int = Field(1, description="Parallel Optuna workers (-1 = all cores).")
+    seed: int = Field(42, description="Seed for the TPE sampler.")
+    n_jobs: int = Field(1, description="Parallel Optuna workers.")
     storage: str | None = Field(
         None,
-        description="Optuna storage URL (None = in-memory). E.g. 'sqlite:///optuna.db'.",
+        description="Optuna storage URL. E.g. 'sqlite:///artifacts/optuna_study.db'.",
+    )
+    study_name: str = Field(
+        "dialong_automl_study", description="Optuna study name (for SQLite persistence)."
     )
 
 
 # ---------------------------------------------------------------------------
-# API placeholder (Phase 5+)
+# GRU configuration (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+class GRUConfig(BaseModel):
+    """GRU training configuration."""
+
+    epochs: int = Field(30, description="Maximum training epochs per GRU trial.")
+    patience: int = Field(5, description="Early-stopping patience (validation AUROC).")
+    batch_size: int = Field(32, description="Default batch size (overridden by Optuna).")
+    hidden_size: int = Field(64, description="Default hidden size (overridden by Optuna).")
+    num_layers: int = Field(1, description="Default GRU layers (overridden by Optuna).")
+    dropout: float = Field(0.0, description="Default dropout (overridden by Optuna).")
+    learning_rate: float = Field(1e-3, description="Default LR (overridden by Optuna).")
+    weight_decay: float = Field(1e-5, description="Default weight decay.")
+
+
+# ---------------------------------------------------------------------------
+# Training configuration (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+class TrainingConfig(BaseModel):
+    """Top-level training configuration."""
+
+    seed: int = Field(42, description="Master seed for training reproducibility.")
+    threshold: float = Field(
+        0.5, description="Default classification threshold for binary predictions."
+    )
+    max_iter_sklearn: int = Field(
+        2000, description="Max iterations for sklearn iterative models (e.g. LogReg)."
+    )
+    threshold_strategy: str = Field(
+        "fixed",
+        description=(
+            "How the classification threshold is chosen. "
+            "'fixed' uses training.threshold. "
+            "'validation_f1' maximises F1 on the validation set only."
+        ),
+    )
+
+    @field_validator("threshold_strategy")
+    @classmethod
+    def _validate_threshold_strategy(cls, v: str) -> str:
+        allowed = {"fixed", "validation_f1"}
+        if v not in allowed:
+            raise ValueError(f"threshold_strategy must be one of {allowed}, got {v!r}")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# API placeholder (Phase 6+)
 # ---------------------------------------------------------------------------
 
 
@@ -286,7 +342,10 @@ class AppConfig(BaseModel):
     data: SyntheticDataConfig = Field(default_factory=SyntheticDataConfig)
     cohort: CohortBuilderConfig = Field(default_factory=CohortBuilderConfig)
     split: SplitterConfig = Field(default_factory=SplitterConfig)
-    # Later phases
+    # Phase 5 sections
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    gru: GRUConfig = Field(default_factory=GRUConfig)
+    # Shared
     model: ModelConfig = Field(default_factory=ModelConfig)
     optuna: OptunaConfig = Field(default_factory=OptunaConfig)
     api: APIConfig = Field(default_factory=APIConfig)

@@ -211,18 +211,37 @@ class ModelRegistry:
 
 REGISTRY = ModelRegistry()
 
+def _lazy_factory(module_path: str, class_name: str) -> Callable[..., Any]:
+    """Import a model class only when the factory is actually called.
+
+    Missing compiled dependencies (xgboost/lightgbm/torch) therefore fail
+    at instantiation with the original ImportError rather than at package
+    import, and are never silently replaced by another model.
+    """
+
+    def factory(hyperparams: dict[str, Any] | None = None) -> Any:
+        import importlib
+
+        module = importlib.import_module(module_path)
+        cls = getattr(module, class_name)
+        return cls(hyperparams=hyperparams)
+
+    factory.__name__ = class_name
+    factory.__qualname__ = class_name
+    return factory
+
+
 # ---------------------------------------------------------------------------
-# Phase 1 entries — planned placeholders only.
-# Factories are None until the implementing phase registers them.
+# Phase 5 entries — functional factories. TCN remains not implemented.
 # ---------------------------------------------------------------------------
 
 REGISTRY.register(
     RegistryEntry(
         name="logistic_regression",
-        status=ModelStatus.PLANNED,
-        description=(
-            "Logistic Regression baseline (scikit-learn).  "
-            "Planned for Phase 2."
+        status=ModelStatus.AVAILABLE,
+        description="Logistic Regression (sklearn) on the wide representation.",
+        factory=_lazy_factory(
+            "dialong_automl.models.logistic_regression", "LogisticRegressionModel"
         ),
         tags=["tabular", "linear", "baseline"],
     )
@@ -231,10 +250,10 @@ REGISTRY.register(
 REGISTRY.register(
     RegistryEntry(
         name="random_forest",
-        status=ModelStatus.PLANNED,
-        description=(
-            "Random Forest ensemble (scikit-learn).  "
-            "Planned for Phase 2."
+        status=ModelStatus.AVAILABLE,
+        description="Random Forest (sklearn) on the wide representation.",
+        factory=_lazy_factory(
+            "dialong_automl.models.random_forest", "RandomForestModel"
         ),
         tags=["tabular", "ensemble", "tree"],
     )
@@ -243,10 +262,10 @@ REGISTRY.register(
 REGISTRY.register(
     RegistryEntry(
         name="xgboost",
-        status=ModelStatus.PLANNED,
-        description=(
-            "Gradient-boosted trees via XGBoost.  "
-            "Planned for Phase 2."
+        status=ModelStatus.AVAILABLE,
+        description="XGBoost classifier on the wide representation.",
+        factory=_lazy_factory(
+            "dialong_automl.models.xgboost_model", "XGBoostModel"
         ),
         tags=["tabular", "ensemble", "tree", "gradient-boosting"],
     )
@@ -255,10 +274,10 @@ REGISTRY.register(
 REGISTRY.register(
     RegistryEntry(
         name="lightgbm",
-        status=ModelStatus.PLANNED,
-        description=(
-            "Gradient-boosted trees via LightGBM.  "
-            "Planned for Phase 2."
+        status=ModelStatus.AVAILABLE,
+        description="LightGBM classifier on the wide representation.",
+        factory=_lazy_factory(
+            "dialong_automl.models.lightgbm_model", "LightGBMModel"
         ),
         tags=["tabular", "ensemble", "tree", "gradient-boosting"],
     )
@@ -267,11 +286,9 @@ REGISTRY.register(
 REGISTRY.register(
     RegistryEntry(
         name="gru",
-        status=ModelStatus.PLANNED,
-        description=(
-            "Gated Recurrent Unit (PyTorch) for longitudinal sequences.  "
-            "Planned for Phase 4."
-        ),
+        status=ModelStatus.AVAILABLE,
+        description="GRU (PyTorch) on the padded sequence representation.",
+        factory=_lazy_factory("dialong_automl.models.gru", "GRUModel"),
         tags=["sequential", "rnn", "deep-learning"],
     )
 )

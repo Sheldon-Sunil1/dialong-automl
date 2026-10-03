@@ -59,10 +59,12 @@ def test_model_is_registered(name: str) -> None:
     "name",
     ["logistic_regression", "random_forest", "xgboost", "lightgbm", "gru"],
 )
-def test_tabular_and_sequential_models_are_planned(name: str) -> None:
-    """Non-TCN models have status PLANNED (not yet available)."""
+def test_tabular_and_sequential_models_are_available(name: str) -> None:
+    """Phase 5: non-TCN models are now AVAILABLE (factories registered)."""
     entry = REGISTRY.get(name)
-    assert entry.status == ModelStatus.PLANNED
+    assert entry.status == ModelStatus.AVAILABLE, (
+        f"{name} expected AVAILABLE in Phase 5, got {entry.status.value}"
+    )
 
 
 def test_tcn_is_planned_not_implemented() -> None:
@@ -71,22 +73,18 @@ def test_tcn_is_planned_not_implemented() -> None:
     assert entry.status == ModelStatus.PLANNED_NOT_IMPLEMENTED
 
 
-def test_no_models_available_in_phase_1() -> None:
-    """No models are available (factories registered) in Phase 1."""
-    assert REGISTRY.list_available() == []
-
-
-def test_all_models_in_planned_list() -> None:
-    """All 6 models appear in list_planned()."""
-    planned = REGISTRY.list_planned()
-    assert set(planned) == {
-        "logistic_regression",
-        "random_forest",
-        "xgboost",
-        "lightgbm",
-        "gru",
-        "tcn",
+def test_all_five_models_available_in_phase_5() -> None:
+    """Phase 5: all 5 real models are available; only TCN is planned."""
+    available = set(REGISTRY.list_available())
+    assert available == {
+        "logistic_regression", "random_forest", "xgboost", "lightgbm", "gru"
     }
+
+
+def test_only_tcn_in_planned_list() -> None:
+    """Phase 5: only TCN remains in the planned list."""
+    planned = REGISTRY.list_planned()
+    assert set(planned) == {"tcn"}
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +130,10 @@ def test_tcn_factory_is_none() -> None:
     "name",
     ["logistic_regression", "random_forest", "xgboost", "lightgbm", "gru"],
 )
-def test_planned_model_factory_raises_not_implemented(name: str) -> None:
-    """get_factory on a PLANNED model with no factory raises NotImplementedError."""
-    with pytest.raises(NotImplementedError):
-        REGISTRY.get_factory(name)
+def test_available_model_factory_returns_callable(name: str) -> None:
+    """Phase 5: get_factory on an AVAILABLE model returns a callable (not raises)."""
+    factory = REGISTRY.get_factory(name)
+    assert callable(factory)
 
 
 # ---------------------------------------------------------------------------

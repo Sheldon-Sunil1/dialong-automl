@@ -89,7 +89,7 @@ def set_global_seed(
             logger.debug("torch.use_deterministic_algorithms(True) enabled.")
 
         logger.debug("PyTorch seed set to %d", seed)
-    except ImportError:
+    except (ImportError, OSError):
         logger.debug("PyTorch not available — skipping torch seed.")
 
     logger.info("Global random seed set to %d", seed)
