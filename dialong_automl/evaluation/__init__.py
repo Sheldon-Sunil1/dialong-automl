@@ -1,10 +1,27 @@
-"""Evaluation sub-package for DiaLong-AutoML.
+"""Evaluation sub-package for DiaLong-AutoML — Phase 5.
 
-Phase 1 — skeleton only.
+Usage::
 
-Future phases will add:
-- Classification metrics (ROC-AUC, AUPRC, calibration)
-- Temporal evaluation strategies
-- Model comparison utilities
-- Report generation
+    from dialong_automl.evaluation import evaluate, auroc, auprc
 """
+
+from dialong_automl.evaluation.metrics import (
+    auroc,
+    auprc,
+    accuracy,
+    precision,
+    recall,
+    specificity,
+    f1_score,
+    brier_score,
+    confusion_matrix,
+    evaluate,
+    select_threshold_by_f1,
+    metrics_to_jsonable,
+)
+
+__all__ = [
+    "auroc", "auprc", "accuracy", "precision", "recall",
+    "specificity", "f1_score", "brier_score", "confusion_matrix", "evaluate",
+    "select_threshold_by_f1", "metrics_to_jsonable",
+]

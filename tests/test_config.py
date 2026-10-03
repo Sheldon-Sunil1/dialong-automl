@@ -56,9 +56,9 @@ def test_default_log_level() -> None:
 
 
 def test_default_optuna_trials() -> None:
-    """Default Optuna n_trials is 50."""
+    """Default Optuna n_trials is 5 (demo preset, updated in Phase 5)."""
     cfg = load_config(None)
-    assert cfg.optuna.n_trials == 50
+    assert cfg.optuna.n_trials == 5
 
 
 def test_default_api_port() -> None:
@@ -87,9 +87,9 @@ def test_demo_fast_seed() -> None:
 
 
 def test_demo_fast_optuna_trials() -> None:
-    """demo_fast.yaml sets n_trials=10 (fast preset)."""
+    """demo_fast.yaml sets n_trials=5 (Phase 5 fast demo preset)."""
     cfg = load_config(_repo_root() / "configs" / "demo_fast.yaml")
-    assert cfg.optuna.n_trials == 10
+    assert cfg.optuna.n_trials == 5
 
 
 def test_demo_fast_enabled_models() -> None:

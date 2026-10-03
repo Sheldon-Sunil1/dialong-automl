@@ -1,17 +1,14 @@
-"""Configuration sub-package for DiaLong-AutoML.
-
-Exports the primary config loader and the top-level :class:`AppConfig` model
-so callers can do::
-
-    from dialong_automl.config import load_config, AppConfig
-"""
+"""Configuration sub-package for DiaLong-AutoML."""
 
 from dialong_automl.config.loader import load_config
 from dialong_automl.config.schema import (
     AppConfig,
     CohortBuilderConfig,
+    GRUConfig,
+    OptunaConfig,
     SplitterConfig,
     SyntheticDataConfig,
+    TrainingConfig,
 )
 
 __all__ = [
@@ -20,4 +17,7 @@ __all__ = [
     "SyntheticDataConfig",
     "CohortBuilderConfig",
     "SplitterConfig",
+    "TrainingConfig",
+    "GRUConfig",
+    "OptunaConfig",
 ]
