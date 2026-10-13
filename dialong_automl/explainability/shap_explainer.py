@@ -133,6 +133,95 @@ def _permutation_importance(
 # SHAP computation helpers
 # ---------------------------------------------------------------------------
 
+#: Positive-class index for binary classification. Every model wrapper's
+#: ``predict_proba`` returns P(class 1), so explanations use the class-1 slice.
+_POSITIVE_CLASS_INDEX = 1
+
+
+def _positive_class_shap(sv: Any, n_features: int) -> np.ndarray:
+    """Normalize raw TreeExplainer output to class-1 SHAP values.
+
+    Different SHAP versions and model families return binary-classification
+    SHAP values in different shapes.  All must be reduced to a signed
+    ``(n_samples, n_features)`` array for the **positive class (class 1)**,
+    which is the class whose probability every model wrapper's
+    ``predict_proba`` returns.
+
+    Only the following verified layouts are supported:
+
+    * ``list`` of per-class arrays, e.g. ``[class0, class1]`` — older SHAP
+      and some LightGBM/XGBoost paths.  Select class 1 when two or more
+      classes are present; a single-element list falls back to that element.
+    * 2-D ndarray ``(n_samples, n_features)`` — current LightGBM binary
+      output.  Already the positive-class contribution; preserved as-is.
+    * 3-D ndarray ``(n_samples, n_features, n_classes)`` — current
+      scikit-learn RandomForest output.  Selects class index 1 and requires
+      the feature axis to equal *n_features* and at least two classes.
+
+    Any other shape — including a 3-D array whose middle axis does not match
+    *n_features*, or one with fewer than two classes — is rejected with a
+    :class:`ValueError` rather than guessed.
+
+    Parameters
+    ----------
+    sv:
+        Raw return value of ``shap.TreeExplainer.shap_values``.
+    n_features:
+        Expected number of features.  Used to validate the layout of a 3-D
+        array unambiguously.
+
+    Returns
+    -------
+    np.ndarray of shape ``(n_samples, n_features)``, dtype float64.
+
+    Raises
+    ------
+    ValueError
+        If the SHAP output cannot be mapped unambiguously to a supported
+        ``(n_samples, n_features)`` layout.
+    """
+    # Legacy list of per-class arrays: [class0, class1, ...].
+    if isinstance(sv, list):
+        if len(sv) == 0:
+            raise ValueError("SHAP value list is empty; cannot select a class.")
+        if len(sv) == 1:
+            # Single-element list: no class dimension to select from.
+            chosen = sv[0]
+        else:
+            # Two or more classes present: select the positive class.
+            chosen = sv[_POSITIVE_CLASS_INDEX]
+        arr = np.asarray(chosen, dtype=np.float64)
+    else:
+        arr = np.asarray(sv, dtype=np.float64)
+
+    if arr.ndim == 2:
+        # (n_samples, n_features) — already positive-class contributions.
+        return arr
+
+    if arr.ndim == 3:
+        # Only the standard (n_samples, n_features, n_classes) layout is
+        # supported.  Validate the feature axis and class count explicitly;
+        # do not guess which axis is the class axis.
+        _, feat_axis, n_classes = arr.shape
+        if feat_axis != n_features:
+            raise ValueError(
+                f"Ambiguous 3-D SHAP array {arr.shape!r}: feature axis "
+                f"(dim 1 = {feat_axis}) does not match expected n_features "
+                f"= {n_features}. Expected (n_samples, n_features, n_classes)."
+            )
+        if n_classes < 2:
+            raise ValueError(
+                f"3-D SHAP array {arr.shape!r} has only {n_classes} class(es); "
+                "a binary (>=2 class) class axis is required to select class 1."
+            )
+        return arr[:, :, _POSITIVE_CLASS_INDEX]
+
+    raise ValueError(
+        f"Unexpected SHAP value shape {arr.shape!r}; cannot reduce to "
+        f"(n_samples, {n_features})."
+    )
+
+
 def _compute_shap_values(
     model: BaseModel, X_processed: np.ndarray
 ) -> np.ndarray | None:
@@ -140,8 +229,9 @@ def _compute_shap_values(
 
     Returns
     -------
-    np.ndarray of shape (n_samples, n_features) with signed SHAP values,
-    or ``None`` when SHAP is unavailable or the model is not supported.
+    np.ndarray of shape (n_samples, n_features) with signed SHAP values for
+    the positive class (class 1), or ``None`` when SHAP is unavailable or
+    the model is not supported.
     """
     if not _shap_available():
         logger.info("shap package not available; falling back to permutation importance.")
@@ -156,10 +246,11 @@ def _compute_shap_values(
         import shap
         explainer = shap.TreeExplainer(clf)
         sv = explainer.shap_values(X_processed)
-        # LightGBM returns list [class0, class1] for binary; take class-1 values
-        if isinstance(sv, list):
-            sv = sv[1] if len(sv) > 1 else sv[0]
-        return np.asarray(sv, dtype=np.float64)
+        # Normalize to class-1 (positive class) signed values of shape
+        # (n_samples, n_features). Handles list, 2-D, and 3-D SHAP outputs
+        # so RandomForest (3-D) and LightGBM/XGBoost (list or 2-D) agree.
+        n_features = int(X_processed.shape[1])
+        return _positive_class_shap(sv, n_features)
     except Exception as exc:
         logger.warning(
             "SHAP TreeExplainer failed for %s (%s). "
