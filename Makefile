@@ -143,7 +143,10 @@ clean-all: clean  ## Remove build artefacts + virtual environment
 # tune:  ## Run Optuna hyperparameter search [Phase 3+]
 # 	$(PYTHON) -m $(PACKAGE).pipeline.tune --config configs/demo_fast.yaml
 
-# Phase 5+
-# .PHONY: serve
-# serve:  ## Start the FastAPI prediction server [Phase 5+]
-# 	uvicorn $(PACKAGE).api.app:app --host 0.0.0.0 --port 8000 --reload
+# Phase 9 — API & Serving
+API_HOST ?= 0.0.0.0
+API_PORT ?= 8000
+
+.PHONY: serve
+serve:  ## Start the FastAPI prediction server (Phase 9)
+	uvicorn $(PACKAGE).api.app:app --host $(API_HOST) --port $(API_PORT)
