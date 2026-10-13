@@ -46,6 +46,7 @@ from dialong_automl.explainability.shap_explainer import (
     _shap_available,
     _model_supports_tree_shap,
     _permutation_importance,
+    _positive_class_shap,
 )
 from dialong_automl.features.wide import FeatureInfo, NUMERIC_FEATURES
 
@@ -768,6 +769,167 @@ class TestRandomForestBlocked:
         assert isinstance(result, GlobalExplanation)
         assert result.model_name == "random_forest"
         assert len(result.features) > 0
+
+    @SKIP_RF_ENSEMBLE
+    @SKIP_SHAP
+    def test_rf_global_explanation_shap_structure_and_direction(self):
+        """RF global explanation via SHAP yields correct structure & directions.
+
+        Regression guard for the 3-D ``(n_samples, n_features, n_classes)``
+        SHAP output that scikit-learn RandomForest produces under modern
+        SHAP. The direction must be a scalar label per feature, computed on
+        the positive-class slice — never an array-valued comparison.
+        """
+        from dialong_automl.models.random_forest import RandomForestModel
+
+        X, y = _tabular_Xy(n=80)
+        df = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+        m = RandomForestModel({"n_estimators": 25, "random_state": 42})
+        m.fit(X, y)
+        prep = _fitted_preprocessor(df)
+
+        result = TreeExplainerWrapper(m, prep).global_explanation(df, y=y, n_top=6)
+
+        # When SHAP drives the explanation, directions must be present and valid.
+        if result.explanation_method == "shap_tree":
+            assert len(result.features) == 6
+            for e in result.features:
+                assert e.explanation_method == "shap_tree"
+                # Direction is a single scalar label, not an array.
+                assert e.direction in ("positive", "negative")
+                assert isinstance(e.importance, float)
+                # Mean-absolute SHAP importance is non-negative by construction.
+                assert e.importance >= 0.0
+            ranks = [e.rank for e in result.features]
+            assert ranks == list(range(1, 7))
+
+    @SKIP_RF_ENSEMBLE
+    @SKIP_SHAP
+    def test_rf_shap_values_normalized_to_two_dims(self):
+        """_compute_shap_values returns (n_samples, n_features) for RF.
+
+        RF raw SHAP output is 3-D; the normalizer must reduce it to the
+        positive-class 2-D array so downstream mean/direction math is scalar.
+        """
+        from dialong_automl.explainability.shap_explainer import _compute_shap_values
+        from dialong_automl.models.random_forest import RandomForestModel
+
+        X, y = _tabular_Xy(n=50)
+        m = RandomForestModel({"n_estimators": 15, "random_state": 42})
+        m.fit(X, y)
+
+        sv = _compute_shap_values(m, X.astype(np.float32))
+        assert sv is not None
+        assert sv.ndim == 2
+        assert sv.shape == (X.shape[0], X.shape[1])
+
+
+# ---------------------------------------------------------------------------
+# 9b. SHAP output-shape normalization (version/model agnostic unit tests)
+# ---------------------------------------------------------------------------
+
+class TestPositiveClassShapNormalization:
+    """Unit tests for _positive_class_shap across SHAP output shapes.
+
+    These do not require sklearn or lightgbm — they exercise the pure
+    shape-normalization logic directly.
+    """
+
+    def test_two_dim_passthrough(self):
+        """A 2-D (n_samples, n_features) array (LightGBM) passes through."""
+        arr = np.arange(12, dtype=np.float64).reshape(4, 3)
+        out = _positive_class_shap(arr, n_features=3)
+        assert out.shape == (4, 3)
+        np.testing.assert_array_equal(out, arr)
+
+    def test_three_dim_selects_positive_class(self):
+        """A 3-D (n_samples, n_features, n_classes) array (RF) selects class 1."""
+        n, f = 5, 3
+        class0 = np.full((n, f), -1.0)
+        class1 = np.full((n, f), 2.0)
+        arr = np.stack([class0, class1], axis=-1)  # (n, f, 2)
+        assert arr.shape == (n, f, 2)
+        out = _positive_class_shap(arr, n_features=f)
+        assert out.shape == (n, f)
+        np.testing.assert_array_equal(out, class1)
+
+    def test_list_selects_positive_class(self):
+        """A list [class0, class1] (older SHAP) selects class 1."""
+        n, f = 4, 2
+        class0 = np.zeros((n, f))
+        class1 = np.ones((n, f))
+        out = _positive_class_shap([class0, class1], n_features=f)
+        assert out.shape == (n, f)
+        np.testing.assert_array_equal(out, class1)
+
+    def test_list_single_element(self):
+        """A single-element list falls back to that element."""
+        n, f = 3, 2
+        only = np.full((n, f), 0.5)
+        out = _positive_class_shap([only], n_features=f)
+        assert out.shape == (n, f)
+        np.testing.assert_array_equal(out, only)
+
+    def test_direction_is_scalar_after_normalization(self):
+        """Mean-signed over a normalized array yields scalar-comparable values."""
+        n, f = 6, 3
+        class1 = np.array([[1.0, -2.0, 0.5]] * n)
+        arr = np.stack([np.zeros((n, f)), class1], axis=-1)
+        out = _positive_class_shap(arr, n_features=f)
+        mean_signed = out.mean(axis=0)
+        assert mean_signed.shape == (f,)
+        directions = ["positive" if v > 0 else "negative" for v in mean_signed]
+        assert directions == ["positive", "negative", "positive"]
+
+    def test_unexpected_shape_raises(self):
+        """A 1-D array cannot be mapped to (n_samples, n_features)."""
+        with pytest.raises(ValueError, match="Unexpected SHAP value shape"):
+            _positive_class_shap(np.zeros(5), n_features=3)
+
+    def test_four_dim_raises(self):
+        """A 4-D array is not a supported layout."""
+        with pytest.raises(ValueError, match="Unexpected SHAP value shape"):
+            _positive_class_shap(np.zeros((2, 3, 2, 2)), n_features=3)
+
+    def test_three_dim_wrong_feature_axis_raises(self):
+        """A 3-D array whose middle axis != n_features is ambiguous → ValueError."""
+        # (n_samples=4, middle=5, n_classes=2) but we expect 3 features.
+        arr = np.zeros((4, 5, 2))
+        with pytest.raises(ValueError, match="Ambiguous 3-D SHAP array"):
+            _positive_class_shap(arr, n_features=3)
+
+    def test_three_dim_class_axis_in_middle_raises(self):
+        """(n_samples, n_classes, n_features) is NOT guessed; it raises.
+
+        The feature axis must be dim 1. A middle class axis (dim 1 = 2)
+        that doesn't equal n_features must be rejected, not silently reshaped.
+        """
+        # (n_samples=4, n_classes=2, n_features=3): feature axis is dim 2, not dim 1.
+        arr = np.zeros((4, 2, 3))
+        with pytest.raises(ValueError, match="Ambiguous 3-D SHAP array"):
+            _positive_class_shap(arr, n_features=3)
+
+    def test_three_dim_single_class_raises(self):
+        """A 3-D array with a single-class axis cannot yield class 1."""
+        arr = np.zeros((4, 3, 1))
+        with pytest.raises(ValueError, match="only 1 class"):
+            _positive_class_shap(arr, n_features=3)
+
+    def test_three_dim_multiclass_selects_index_one(self):
+        """For >2 classes, class index 1 (not the last) is selected."""
+        n, f = 3, 3
+        class0 = np.full((n, f), 0.0)
+        class1 = np.full((n, f), 1.0)
+        class2 = np.full((n, f), 2.0)
+        arr = np.stack([class0, class1, class2], axis=-1)  # (n, f, 3)
+        out = _positive_class_shap(arr, n_features=f)
+        assert out.shape == (n, f)
+        np.testing.assert_array_equal(out, class1)
+
+    def test_empty_list_raises(self):
+        """An empty per-class list has no class to select."""
+        with pytest.raises(ValueError, match="empty"):
+            _positive_class_shap([], n_features=3)
 
 
 # ---------------------------------------------------------------------------
