@@ -49,7 +49,8 @@ dev = [
 ]
 
 [project.scripts]
-dialong = "dialong_automl.cli:main"
+dialong-train = "dialong_automl.train:main"
+dialong-predict = "dialong_automl.predict:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
