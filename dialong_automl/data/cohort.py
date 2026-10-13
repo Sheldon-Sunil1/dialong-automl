@@ -571,9 +571,26 @@ class CohortBuilder:
                     future_grp["visit_date"] > cutoff_date
                 ]
 
-            # --- Exclude patients with diabetes already at baseline ---
-            if self.cfg.exclude_known_diabetes_at_baseline and "diabetes_diagnosis" in obs_grp_full.columns:
-                if (obs_grp_full["diabetes_diagnosis"] == 1).any():
+            # --- Exclude patients already diabetic during the observation window ---
+            # "Known diabetes at baseline" must be judged by the SAME onset
+            # criterion used to derive the target: a recorded diagnosis OR an
+            # observation-window HbA1c at/above the onset threshold.  Checking
+            # only diabetes_diagnosis is insufficient on data where that flag is
+            # never set during observation (e.g. the synthetic generator), which
+            # would otherwise admit patients who are already hyperglycaemic at
+            # cutoff and make "future onset" trivially predictable.  This uses
+            # observation data only (no leakage) and leaves the target rule and
+            # prediction horizon unchanged.
+            if self.cfg.exclude_known_diabetes_at_baseline:
+                already_diabetic = False
+                if "diabetes_diagnosis" in obs_grp_full.columns:
+                    already_diabetic = bool((obs_grp_full["diabetes_diagnosis"] == 1).any())
+                if not already_diabetic and "hba1c" in obs_grp_full.columns:
+                    obs_hba1c = pd.to_numeric(obs_grp_full["hba1c"], errors="coerce")
+                    already_diabetic = bool(
+                        (obs_hba1c >= self.cfg.diabetes_onset_hba1c_threshold).any()
+                    )
+                if already_diabetic:
                     n_excluded_prior_diabetes += 1
                     continue
 

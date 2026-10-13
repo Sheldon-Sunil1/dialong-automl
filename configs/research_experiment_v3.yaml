@@ -1,0 +1,146 @@
+# =============================================================================
+# DiaLong-AutoML — research_experiment_v3 configuration
+# Phase 8: research experiment AFTER the experiment-validity fix.
+#
+# Difference vs v2: the cohort builder now excludes patients who are already
+# diabetic DURING the observation window by the HbA1c onset criterion (not only
+# by a diabetes_diagnosis flag that the synthetic generator never sets in the
+# observation window). This makes the task a genuine FUTURE-onset prediction
+# among currently non-diabetic patients, rather than a near-trivial
+# "already diabetic now" classification.
+#
+# All artifacts/outputs/Optuna study go to NEW research_v3 paths so the v2 and
+# original research results are preserved untouched.
+#
+# Optuna storage URI note: the pipeline joins a relative sqlite URI under
+# paths.artifacts_dir and strips only a leading segment equal to the basename
+# ("research_v3"). So "sqlite:///research_v3/optuna_study.db" resolves to
+# artifacts/research_v3/optuna_study.db (no double-nesting).
+#
+# DISCLAIMER: Synthetic demonstration data only. NOT clinical evidence and does
+# NOT establish clinical validity.
+# =============================================================================
+
+project_name: "DiaLong-AutoML"
+version: "0.1.0"
+description: "Research experiment v3 — longitudinal AutoML on synthetic data (valid cohort)"
+
+paths:
+  data_dir: "data"
+  artifacts_dir: "artifacts/research_v3"
+  outputs_dir: "outputs/research_v3"
+  logs_dir: "logs"
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  log_to_file: false
+  log_filename: "dialong_automl.log"
+  max_bytes: 10485760
+  backup_count: 3
+
+reproducibility:
+  seed: 42
+  deterministic_torch: false
+  benchmark_cudnn: false
+
+# ---------------------------------------------------------------------------
+# Synthetic data [Phase 2] — 1,000 patients
+# ---------------------------------------------------------------------------
+data:
+  patients: 1000
+  min_visits: 4
+  max_visits: 6
+  min_future_visits: 2
+  max_future_visits: 4
+  min_days_between_visits: 90
+  max_days_between_visits: 240
+  missingness_rate: 0.05
+  progression_prevalence: 0.30
+  seed: 42
+  output_dir: "data/synthetic"
+
+# ---------------------------------------------------------------------------
+# Cohort [Phase 3] — canonical future-outcome mode; exclude baseline-diabetic
+# ---------------------------------------------------------------------------
+cohort:
+  mode: "future_outcome"
+  min_observation_visits: 3
+  max_observation_visits: 4
+  prediction_horizon_days: 365
+  diabetes_onset_hba1c_threshold: 6.5
+  exclude_known_diabetes_at_baseline: true
+  require_followup_after_cutoff: true
+
+# ---------------------------------------------------------------------------
+# Split [Phase 3] — stratified patient-level 70/15/15
+# ---------------------------------------------------------------------------
+split:
+  train_size: 0.70
+  validation_size: 0.15
+  test_size: 0.15
+  random_seed: 42
+  stratify: true
+  chronological: false
+
+# ---------------------------------------------------------------------------
+# Training [Phase 5]
+# ---------------------------------------------------------------------------
+training:
+  seed: 42
+  threshold: 0.5
+  threshold_strategy: "fixed"
+  max_iter_sklearn: 2000
+
+# ---------------------------------------------------------------------------
+# GRU [Phase 5]
+# ---------------------------------------------------------------------------
+gru:
+  epochs: 40
+  patience: 6
+  batch_size: 32
+  hidden_size: 64
+  num_layers: 1
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+
+# ---------------------------------------------------------------------------
+# Model search space [Phase 5] — all implemented models
+# ---------------------------------------------------------------------------
+model:
+  enabled_models:
+    - logistic_regression
+    - random_forest
+    - xgboost
+    - lightgbm
+    - gru
+  hyperparameter_overrides: {}
+
+# ---------------------------------------------------------------------------
+# Optuna [Phase 5]
+# ---------------------------------------------------------------------------
+optuna:
+  n_trials: 40
+  timeout_seconds: null
+  direction: "maximize"
+  metric: "roc_auc"
+  pruner: "MedianPruner"
+  sampler: "TPESampler"
+  seed: 42
+  n_jobs: 1
+  storage: "sqlite:///research_v3/optuna_study.db"   # -> artifacts/research_v3/optuna_study.db
+  study_name: "dialong_research_v3_study"
+
+# ---------------------------------------------------------------------------
+# API [placeholder — Phase 9]
+# ---------------------------------------------------------------------------
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  workers: 1
+  title: "DiaLong-AutoML API"
+  version: "0.1.0"
+  docs_url: "/docs"
+  redoc_url: "/redoc"

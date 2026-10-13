@@ -178,6 +178,109 @@ class HeldOutTestSet:
         return len(self._patient_ids)
 
 
+def _aligned_labels(representation: Any, split_name: str) -> np.ndarray:
+    """Return the builder's row-aligned labels as an int32 array.
+
+    The representation's ``.y`` is a pandas Series whose order matches the
+    rows of ``representation.X`` (both ordered by the builder's sorted
+    patient_id).  Using it guarantees each label corresponds to the patient
+    of the same feature row — unlike ``split.*_targets.values``, which
+    follows the splitter's shuffled patient-ID order.
+
+    Raises
+    ------
+    ValueError
+        If the builder produced no labels (``representation.y is None``) or
+        the label count does not match the number of feature rows.
+    """
+    y = getattr(representation, "y", None)
+    if y is None:
+        raise ValueError(
+            f"Representation for the {split_name!r} split has no labels (.y is None); "
+            "cannot align targets. Ensure patient_targets were passed to the builder."
+        )
+    n_rows = len(representation.patient_ids)
+    if len(y) != n_rows:
+        raise ValueError(
+            f"Label/row count mismatch for the {split_name!r} split: "
+            f"{len(y)} labels vs {n_rows} feature rows. "
+            "This indicates patients were dropped between features and targets."
+        )
+    return y.values.astype(np.int32)
+
+
+def _assert_same_patient_order(wide_rep: Any, seq_rep: Any, split_name: str) -> None:
+    """Fail loudly if the wide and sequence builders disagree on patient order.
+
+    The Optuna search shares a single label vector across wide and sequence
+    trials, so both representations of a split must enumerate patients in the
+    same order for that shared label vector to be correct for both.
+    """
+    if list(wide_rep.patient_ids) != list(seq_rep.patient_ids):
+        raise RuntimeError(
+            f"Wide and sequence builders produced different patient orders for "
+            f"the {split_name!r} split; a shared label vector would mislabel one "
+            "of them. This should not happen (both sort by patient_id)."
+        )
+
+
+def _internal_patient_split(
+    patient_ids: list[str],
+    targets: pd.Series,
+    val_fraction: float,
+    seed: int,
+    stratify: bool,
+) -> tuple[list[str], list[str]]:
+    """Split *patient_ids* into (internal_train, internal_val) at patient level.
+
+    Used only for the GRU final retrain so early stopping / best-epoch
+    restoration stay active.  The split is reproducible (seeded) and
+    label-preserving.  The test set is never involved here.
+
+    Stratified splitting is attempted first (both classes in each subset);
+    if that is not possible (too few patients of a class), it falls back to a
+    seeded random split rather than failing the whole pipeline.
+
+    Returns
+    -------
+    (internal_train_ids, internal_val_ids)
+        Disjoint, non-empty patient-ID lists whose union is *patient_ids*.
+    """
+    pids = np.array(list(patient_ids))
+    n = len(pids)
+    if n < 2:
+        raise ValueError(
+            f"Need at least 2 patients for an internal train/val split, got {n}."
+        )
+
+    labels = targets.loc[list(pids)].astype(int).values
+    # Ensure at least one patient in each internal subset.
+    n_val = max(1, min(n - 1, round(n * val_fraction)))
+    test_size = n_val / n
+
+    both_classes = len(np.unique(labels)) >= 2
+    if stratify and both_classes:
+        from sklearn.model_selection import StratifiedShuffleSplit
+
+        splitter = StratifiedShuffleSplit(
+            n_splits=1, test_size=test_size, random_state=seed
+        )
+        try:
+            train_idx, val_idx = next(splitter.split(pids, labels))
+            return pids[train_idx].tolist(), pids[val_idx].tolist()
+        except ValueError:
+            logger.warning(
+                "Internal stratified split not possible (%d patients); "
+                "falling back to a seeded random split.", n,
+            )
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    val_sel = perm[:n_val]
+    train_sel = perm[n_val:]
+    return pids[train_sel].tolist(), pids[val_sel].tolist()
+
+
 class TrainingPipeline:
     """Canonical end-to-end training pipeline.
 
@@ -208,6 +311,9 @@ class TrainingPipeline:
             outputs_dir=cfg.paths.outputs_dir,
             logs_dir=cfg.paths.logs_dir,
         )
+        # Records the (internal_train_ids, internal_val_ids) used for the GRU
+        # final retrain; None for non-GRU runs. Exposed for testing/auditing.
+        self._last_internal_split: tuple[list[str], list[str]] | None = None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -320,9 +426,25 @@ class TrainingPipeline:
         X_val_wide = wide_prep.transform(val_wide.X)
         X_test_wide = wide_prep.transform(test_wide.X)  # stored, not used yet
 
-        y_train = split.train_targets.values.astype(np.int32)
-        y_val = split.validation_targets.values.astype(np.int32)
-        y_test = split.test_targets.values.astype(np.int32)
+        # ------------------------------------------------------------------
+        # Labels MUST follow the representation builders' row order, NOT the
+        # splitter's shuffled patient-ID order. Both builders order patients
+        # by sorted patient_id and expose a `.y` Series aligned to their own
+        # feature rows. Using split.*_targets.values here would pair labels
+        # with the wrong patients because the splitter preserves
+        # StratifiedShuffleSplit order while the builders sort.
+        #
+        # The optimizer shares a single y_train / y_val across both wide and
+        # sequence trials, so the two representations must share patient order.
+        # We derive labels from the builder `.y` and assert the wide/sequence
+        # patient orders match, failing loudly rather than mislabelling.
+        _assert_same_patient_order(train_wide, train_seq, "train")
+        _assert_same_patient_order(val_wide, val_seq, "validation")
+        _assert_same_patient_order(test_wide, test_seq, "test")
+
+        y_train = _aligned_labels(train_wide, "train")
+        y_val = _aligned_labels(val_wide, "validation")
+        y_test = _aligned_labels(test_wide, "test")
 
         # ------------------------------------------------------------------
         # Step 6: Fit SequencePreprocessor on train only, transform val + test
@@ -431,8 +553,6 @@ class TrainingPipeline:
             [split.train_targets, split.validation_targets]
         )
 
-        y_trainval = train_val_targets.values.astype(np.int32)
-
         if best_representation == REPRESENTATION_WIDE:
             # Refit wide preprocessor on train+val
             train_val_wide = wide_builder.build(train_val_df, train_val_targets)
@@ -440,31 +560,90 @@ class TrainingPipeline:
             X_trainval = final_wide_prep.fit_transform(train_val_wide.X)
             X_final_test = final_wide_prep.transform(test_wide.X)
             final_seq_prep = None
+            # Labels aligned to the builder's row order (not the concat order
+            # of the shuffled splitter targets).
+            y_trainval = _aligned_labels(train_val_wide, "train+val")
         else:
-            # Refit sequence preprocessor on train+val
-            train_val_seq = SequenceRepresentationBuilder(
+            # Sequence (GRU) retrain.
+            #
+            # The GRU needs a validation signal so early stopping and
+            # best-epoch restoration stay active (see GRUModel.fit). To keep
+            # the held-out TEST set completely untouched, we carve an INTERNAL
+            # validation split out of the combined original train+val patients.
+            #
+            # Preprocessing is fitted on the INTERNAL TRAIN subset only and
+            # applied unchanged to internal-val and test, so internal-val does
+            # not leak into the preprocessor statistics.
+            tv_patients = (
+                train_val_df["patient_id"].drop_duplicates().tolist()
+            )
+            internal_train_ids, internal_val_ids = _internal_patient_split(
+                tv_patients,
+                train_val_targets,
+                val_fraction=self.cfg.split.validation_size
+                / (self.cfg.split.train_size + self.cfg.split.validation_size),
+                seed=self.cfg.split.random_seed,
+                stratify=self.cfg.split.stratify,
+            )
+            self._last_internal_split = (
+                list(internal_train_ids),
+                list(internal_val_ids),
+            )
+
+            itrain_df = train_val_df[
+                train_val_df["patient_id"].isin(internal_train_ids)
+            ].copy()
+            ival_df = train_val_df[
+                train_val_df["patient_id"].isin(internal_val_ids)
+            ].copy()
+            itrain_targets = train_val_targets.loc[internal_train_ids]
+            ival_targets = train_val_targets.loc[internal_val_ids]
+
+            # Build sequence representations using the TRAINING vocabulary
+            # (no vocabulary leakage) for each internal subset and the test set.
+            itrain_seq = SequenceRepresentationBuilder(
                 max_seq_len=max_seq,
                 categorical_vocabularies=dict(train_seq.categorical_vocabularies),
-            ).build(train_val_df, train_val_targets)
+            ).build(itrain_df, itrain_targets)
+            ival_seq = SequenceRepresentationBuilder(
+                max_seq_len=max_seq,
+                categorical_vocabularies=dict(train_seq.categorical_vocabularies),
+            ).build(ival_df, ival_targets)
+
+            # Fit the sequence preprocessor on INTERNAL TRAIN only.
             final_seq_prep = SequencePreprocessor(
-                feature_names=train_val_seq.feature_names
+                feature_names=itrain_seq.feature_names
             )
             X_trainval = final_seq_prep.fit_transform(
-                train_val_seq.X, train_val_seq.mask
+                itrain_seq.X, itrain_seq.mask
             )
+            X_internal_val = final_seq_prep.transform(ival_seq.X, ival_seq.mask)
             X_final_test = final_seq_prep.transform(test_seq.X, test_seq.mask)
             final_wide_prep = None
-            lengths_trainval = _lengths(train_val_seq.mask)
-            mask_trainval = train_val_seq.mask
+
+            # Use the builder's own target Series (result.y), which is aligned
+            # to the sorted patient order of X — not the raw target index order.
+            y_trainval = itrain_seq.y.values.astype(np.int32)
+            y_internal_val = ival_seq.y.values.astype(np.int32)
+            mask_trainval = itrain_seq.mask
+            lengths_trainval = _lengths(itrain_seq.mask)
+            mask_internal_val = ival_seq.mask
+            lengths_internal_val = _lengths(ival_seq.mask)
 
         final_model = build_model(best_model_name, best_hyperparams)
 
         if best_model_name == "gru":
+            # Pass the internal validation set so GRUModel.fit runs early
+            # stopping and restores the best-epoch weights before saving.
             final_model.fit(
                 X_trainval,
                 y_trainval,
                 mask=mask_trainval,
                 lengths=lengths_trainval,
+                X_val=X_internal_val,
+                y_val=y_internal_val,
+                mask_val=mask_internal_val,
+                lengths_val=lengths_internal_val,
             )
         else:
             final_model.fit(X_trainval, y_trainval)

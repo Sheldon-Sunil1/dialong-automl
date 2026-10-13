@@ -139,6 +139,111 @@ def test_prior_diabetes_not_excluded_when_config_false() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Baseline exclusion by HbA1c onset threshold (experiment-validity fix)
+#
+# "Known diabetes at baseline" must use the SAME onset criterion as the target:
+# a recorded diagnosis OR an observation-window HbA1c at/above the threshold.
+# Otherwise, on data where diabetes_diagnosis is never set during observation
+# (e.g. the synthetic generator), already-hyperglycaemic patients are admitted
+# and "future onset" becomes trivially predictable.
+# ---------------------------------------------------------------------------
+
+def test_excludes_patient_with_observation_hba1c_above_threshold() -> None:
+    """A patient already >= onset HbA1c during observation is excluded as baseline-diabetic,
+    even when diabetes_diagnosis is 0 in every observation visit."""
+    patients = {
+        # Already diabetic by HbA1c during observation (6.6 >= 6.5), diag flag never set.
+        "SYN_00001": [
+            _visit("2020-01-01", hba1c=6.6, diabetes_diagnosis=0, is_future=False),
+            _visit("2020-04-01", hba1c=6.7, diabetes_diagnosis=0, is_future=False),
+            _visit("2020-07-01", hba1c=6.8, diabetes_diagnosis=0, is_future=False),
+            _visit("2021-01-01", hba1c=7.5, diabetes_diagnosis=1, is_future=True),
+        ],
+        # Not-yet-diabetic during observation; progresses in the future.
+        "SYN_00002": [
+            _visit("2020-01-01", hba1c=5.6, is_future=False),
+            _visit("2020-04-01", hba1c=5.9, is_future=False),
+            _visit("2020-07-01", hba1c=6.1, is_future=False),
+            _visit("2021-01-01", hba1c=7.0, diabetes_diagnosis=1, is_future=True),
+        ],
+    }
+    df = _make_longitudinal_df(patients)
+    cfg = CohortConfig(
+        mode=CohortMode.FUTURE_OUTCOME,
+        min_observation_visits=3,
+        max_observation_visits=4,
+        prediction_horizon_days=365,
+        diabetes_onset_hba1c_threshold=6.5,
+        exclude_known_diabetes_at_baseline=True,
+    )
+    result = CohortBuilder(cfg).build(df)
+
+    assert "SYN_00001" not in result.patient_targets.index, (
+        "Patient already at/above the HbA1c onset threshold during observation "
+        "must be excluded as baseline-diabetic."
+    )
+    assert "SYN_00002" in result.patient_targets.index
+    assert result.audit.excluded_prior_diabetes == 1
+    # Eligible cohort must contain NO observation HbA1c at/above the threshold.
+    obs = result.observation_data
+    assert (obs["hba1c"] < 6.5).all()
+
+
+def test_hba1c_baseline_exclusion_not_applied_when_config_false() -> None:
+    """When exclusion is disabled, an observation-hyperglycaemic patient is kept."""
+    patients = {
+        "SYN_00001": [
+            _visit("2020-01-01", hba1c=6.6, is_future=False),
+            _visit("2020-04-01", hba1c=6.7, is_future=False),
+            _visit("2020-07-01", hba1c=6.8, is_future=False),
+            _visit("2021-01-01", hba1c=7.5, diabetes_diagnosis=1, is_future=True),
+        ],
+    }
+    df = _make_longitudinal_df(patients)
+    cfg = CohortConfig(
+        mode=CohortMode.FUTURE_OUTCOME,
+        min_observation_visits=3,
+        max_observation_visits=4,
+        prediction_horizon_days=365,
+        diabetes_onset_hba1c_threshold=6.5,
+        exclude_known_diabetes_at_baseline=False,
+    )
+    result = CohortBuilder(cfg).build(df)
+    assert "SYN_00001" in result.patient_targets.index
+    assert result.audit.excluded_prior_diabetes == 0
+
+
+def test_hba1c_baseline_exclusion_respects_threshold_value() -> None:
+    """The exclusion uses the configured threshold, not a hard-coded 6.5."""
+    patients = {
+        # Observation HbA1c max = 6.2: excluded only if threshold <= 6.2.
+        "SYN_00001": [
+            _visit("2020-01-01", hba1c=6.0, is_future=False),
+            _visit("2020-04-01", hba1c=6.1, is_future=False),
+            _visit("2020-07-01", hba1c=6.2, is_future=False),
+            _visit("2021-01-01", hba1c=7.0, diabetes_diagnosis=1, is_future=True),
+        ],
+    }
+    df = _make_longitudinal_df(patients)
+
+    # Threshold 6.0 -> excluded (6.2 >= 6.0).
+    cfg_low = CohortConfig(
+        mode=CohortMode.FUTURE_OUTCOME, min_observation_visits=3,
+        max_observation_visits=4, prediction_horizon_days=365,
+        diabetes_onset_hba1c_threshold=6.0, exclude_known_diabetes_at_baseline=True,
+    )
+    assert "SYN_00001" not in CohortBuilder(cfg_low).build(df).patient_targets.index
+
+    # Threshold 6.5 -> kept (6.2 < 6.5).
+    cfg_high = CohortConfig(
+        mode=CohortMode.FUTURE_OUTCOME, min_observation_visits=3,
+        max_observation_visits=4, prediction_horizon_days=365,
+        diabetes_onset_hba1c_threshold=6.5, exclude_known_diabetes_at_baseline=True,
+    )
+    assert "SYN_00001" in CohortBuilder(cfg_high).build(df).patient_targets.index
+
+
+# ---------------------------------------------------------------------------
 # 2. Progression label uses future records
 # ---------------------------------------------------------------------------
 
