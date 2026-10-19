@@ -334,6 +334,33 @@ class SplitterConfig(BaseModel):
 # ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
+# Evaluation (Phase 11 — research foundation; opt-in, defaults preserve behavior)
+# ---------------------------------------------------------------------------
+
+
+class EvaluationConfig(BaseModel):
+    """Optional settings for the Phase 11 research-evaluation utilities.
+
+    These are **opt-in**. With defaults, nothing in the baseline training,
+    selection, or metric set changes — the utilities are only used when a
+    research run explicitly invokes them.
+    """
+
+    calibration_bins: int = Field(
+        10, description="Number of equal-width bins for ECE/MCE/reliability curves."
+    )
+    stability_top_k: int = Field(
+        5, description="Default k for top-k explanation-stability overlap."
+    )
+    enable_calibration_metrics: bool = Field(
+        False, description="Reserved: compute calibration metrics in research runs."
+    )
+    enable_stability_metrics: bool = Field(
+        False, description="Reserved: compute explanation-stability metrics in research runs."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Database (Phase 10 — patient/visit persistence)
 # ---------------------------------------------------------------------------
 
@@ -380,3 +407,4 @@ class AppConfig(BaseModel):
     optuna: OptunaConfig = Field(default_factory=OptunaConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
