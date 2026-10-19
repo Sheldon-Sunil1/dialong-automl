@@ -323,3 +323,43 @@ def test_predict_rejects_future_outcome_field(loaded_client):
         json={"visits": [{"visit_date": "2020-01-01", "hba1c": 6.0, "future_hba1c": 9.0}]},
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 9. CORS (Phase 10 — frontend integration)
+# ---------------------------------------------------------------------------
+
+def test_cors_allows_configured_origin(tmp_path):
+    """A request from the configured frontend origin receives CORS headers."""
+    with TestClient(create_app(artifact_dir=tmp_path / "empty")) as client:
+        r = client.get(
+            "/health",
+            headers={"Origin": "http://localhost:5173"},
+        )
+    assert r.status_code == 200
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+def test_cors_preflight_allows_predict(tmp_path):
+    """A CORS preflight (OPTIONS) for POST /predict is permitted from the frontend origin."""
+    with TestClient(create_app(artifact_dir=tmp_path / "empty")) as client:
+        r = client.options(
+            "/predict",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+    assert r.status_code in (200, 204)
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+def test_cors_not_wildcard_by_default(tmp_path):
+    """The default allowed origin must NOT be a wildcard."""
+    with TestClient(create_app(artifact_dir=tmp_path / "empty")) as client:
+        r = client.get("/health", headers={"Origin": "http://evil.example.com"})
+    # An unlisted origin must not be echoed back as allowed, and never '*'.
+    allow = r.headers.get("access-control-allow-origin")
+    assert allow != "*"
+    assert allow != "http://evil.example.com"

@@ -36,8 +36,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from dialong_automl.api.schemas import (
     HealthResponse,
@@ -90,7 +90,10 @@ def _sanitize_metadata(meta: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in meta.items() if k not in _SENSITIVE_METADATA_KEYS}
 
 
-def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
+def create_app(
+    artifact_dir: str | Path | None = None,
+    db_path: str | Path | None = None,
+) -> FastAPI:
     """Build the FastAPI application.
 
     Parameters
@@ -98,6 +101,9 @@ def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
     artifact_dir:
         Directory containing training artifacts. When ``None`` it is resolved
         from ``DIALONG_ARTIFACT_DIR`` or the configured default.
+    db_path:
+        SQLite patient-database path. When ``None`` it is resolved from
+        ``DIALONG_DB_PATH`` or the configured default. Tests inject a temp path.
     """
     resolved_dir = _resolve_artifact_dir(artifact_dir)
 
@@ -108,10 +114,18 @@ def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
         api_cfg = load_config(None).api
         title, version = api_cfg.title, api_cfg.version
         docs_url, redoc_url = api_cfg.docs_url, api_cfg.redoc_url
+        cors_origins = list(api_cfg.cors_allow_origins)
     except Exception:  # noqa: BLE001
         title, version, docs_url, redoc_url = (
             "DiaLong-AutoML API", "0.1.0", "/docs", "/redoc",
         )
+        cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+    # Optional env override: comma-separated list of allowed origins. Never
+    # defaults to a wildcard; must be set explicitly per environment.
+    env_origins = os.environ.get("DIALONG_CORS_ORIGINS")
+    if env_origins:
+        cors_origins = [o.strip() for o in env_origins.split(",") if o.strip()]
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -121,6 +135,20 @@ def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
         app.state.model_loaded = False
         app.state.metadata = None
         app.state.load_error = None
+
+        # Initialize the patient database (idempotent; never drops data).
+        try:
+            from dialong_automl.db import PatientRepository, create_session_factory
+
+            engine, session_factory = create_session_factory(db_path)
+            app.state.db_engine = engine
+            app.state.repo = PatientRepository(session_factory)
+            logger.info("API startup: patient database ready.")
+        except Exception as exc:  # noqa: BLE001 — degrade, do not crash
+            app.state.db_engine = None
+            app.state.repo = None
+            logger.warning("API startup: patient database unavailable (%s).", exc)
+
         try:
             meta = _load_metadata(resolved_dir)
             model_name = meta.get("selected_model")
@@ -151,6 +179,51 @@ def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
             "model. Synthetic demonstration data only — not clinically validated."
         ),
         lifespan=lifespan,
+    )
+
+    # CORS: allow the configured frontend origins only (no wildcard default) so
+    # the browser dashboard can call the API cross-origin in development.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    # --- Patient/visit persistence + DB-backed prediction routes ---
+    def _repo_getter():
+        return getattr(app.state, "repo", None)
+
+    def _model_loaded() -> bool:
+        return bool(getattr(app.state, "model_loaded", False))
+
+    def _observation_limit() -> int | None:
+        meta = getattr(app.state, "metadata", None)
+        if not meta:
+            return None
+        val = meta.get("observation_visits")
+        return int(val) if val is not None else None
+
+    def _predict_with_checks(patient_id: str, visits: list[dict[str, Any]]) -> dict[str, Any]:
+        """Shared prediction path: leakage check + fitted-artifact inference."""
+        for i, visit in enumerate(visits):
+            forbidden = sorted(set(visit) & _REPRESENTATION_LEAKAGE_COLUMNS)
+            if forbidden:
+                raise PredictionError(
+                    f"Visit #{i} contains forbidden future/outcome field(s) {forbidden}."
+                )
+        return predict_from_artifacts(app.state.artifact_dir, patient_id, visits)
+
+    from dialong_automl.api.patients import create_patient_router
+
+    app.include_router(
+        create_patient_router(
+            _repo_getter,
+            _predict_with_checks,
+            model_loaded=_model_loaded,
+            observation_limit=_observation_limit,
+        )
     )
 
     @app.get("/health", response_model=HealthResponse, tags=["service"])

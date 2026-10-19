@@ -174,6 +174,32 @@ def _visits_to_frame(patient_id: str, visits: list[dict[str, Any]]) -> pd.DataFr
     return df
 
 
+def _ensure_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee every canonical feature column exists on *df*.
+
+    Representation builders emit a feature layout based on the columns present
+    in their input. At training time all canonical features are present, so the
+    fitted preprocessor expects the full, fixed layout. At inference a partial
+    trajectory may omit some features, which previously produced a truncated
+    layout and an ``IndexError`` in ``SequencePreprocessor.transform``.
+
+    Adding the missing columns as NaN (numeric) / None (categorical) restores
+    the exact training layout. These are genuine "missing" markers — the fitted
+    preprocessor imputes numeric NaNs with the training median and maps absent
+    categoricals to the ``<MISSING>`` one-hot slot, identical to training-time
+    missing-value handling. No clinical values are fabricated and feature order
+    is unchanged.
+    """
+    out = df.copy()
+    for col in NUMERIC_FEATURES:
+        if col not in out.columns:
+            out[col] = np.nan
+    for col in CATEGORICAL_FEATURES:
+        if col not in out.columns:
+            out[col] = None
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Artifact loading
 # ---------------------------------------------------------------------------
@@ -279,6 +305,15 @@ def predict_from_artifacts(
         )
 
     obs_df = _visits_to_frame(patient_id, visits)
+    # Ensure the observation frame has EVERY canonical feature column so the
+    # representation builders emit the full, fixed feature layout that the
+    # fitted preprocessor expects. Absent columns become NaN (numeric) or None
+    # (categorical) — genuine "missing" values that the fitted preprocessor
+    # imputes exactly as it does for missing values during training. This does
+    # NOT fabricate clinical values and does NOT change feature order; it only
+    # prevents a truncated layout (which caused an IndexError in the sequence
+    # SequencePreprocessor.transform when a trajectory omitted some features).
+    obs_df = _ensure_feature_columns(obs_df)
 
     if representation == REPRESENTATION_WIDE:
         from dialong_automl.features.wide import WideRepresentationBuilder

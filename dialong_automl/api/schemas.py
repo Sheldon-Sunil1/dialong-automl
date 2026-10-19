@@ -95,3 +95,81 @@ class ErrorResponse(BaseModel):
     """Structured error payload (never contains stack traces or paths)."""
 
     detail: str
+
+
+# ---------------------------------------------------------------------------
+# Patient / visit persistence (Phase 10 enhancement)
+# ---------------------------------------------------------------------------
+
+
+class VisitInput(BaseModel):
+    """Clinical fields for creating/updating a persisted visit.
+
+    Only ``visit_date`` is required; clinical fields are optional (NULL ==
+    missing, consistent with the inference pipeline). Unknown extra keys are
+    rejected so leakage/typo fields never reach persistence.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    visit_date: str = Field(..., description="ISO-8601 visit date (YYYY-MM-DD).")
+    hba1c: float | None = None
+    fasting_glucose: float | None = None
+    bmi: float | None = None
+    systolic_bp: float | None = None
+    diastolic_bp: float | None = None
+    ldl_cholesterol: float | None = None
+    hdl_cholesterol: float | None = None
+    triglycerides: float | None = None
+    heart_rate: float | None = None
+    age_at_visit: float | None = None
+    sex: str | None = None
+    smoking_status: str | None = None
+    physical_activity_level: str | None = None
+    family_history_diabetes: str | None = None
+    metformin_use: str | None = None
+    hypertension_diagnosis: str | None = None
+
+
+class VisitRecord(VisitInput):
+    """A persisted visit, with its database id and timestamps."""
+
+    id: int
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class PatientHistoryResponse(BaseModel):
+    """A patient's id plus its chronological visit history."""
+
+    patient_id: str
+    created: bool = Field(
+        False, description="True if this request created the patient record."
+    )
+    visits: list[VisitRecord] = Field(default_factory=list)
+
+
+class PatientLookupResponse(BaseModel):
+    """Result of looking up (and optionally creating) a patient."""
+
+    patient_id: str
+    exists: bool
+    created: bool = False
+    visits: list[VisitRecord] = Field(default_factory=list)
+
+
+class PredictSelectionRequest(BaseModel):
+    """DB-backed prediction request: which saved visits to score."""
+
+    model_config = {"extra": "forbid"}
+
+    visit_ids: list[int] = Field(
+        ..., min_length=1, description="IDs of the saved visits to use (>= 1)."
+    )
+
+
+class SelectedPredictResponse(PredictResponse):
+    """Prediction response that also traces the exact selected visits."""
+
+    selected_visit_ids: list[int] = Field(default_factory=list)
+    selected_visit_dates: list[str] = Field(default_factory=list)
