@@ -68,6 +68,15 @@ data/raw/
 data/processed/
 data/external/
 data/synthetic/
+
+# Patient database (Phase 10) — never commit real patient records, incl. WAL/journal.
+data/dialong_patients.db
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
 *.csv
 *.parquet
 *.feather

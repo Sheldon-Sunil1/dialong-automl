@@ -212,6 +212,17 @@ class APIConfig(BaseModel):
     version: str = Field("0.1.0", description="API version string.")
     docs_url: str = Field("/docs", description="Swagger UI endpoint path.")
     redoc_url: str = Field("/redoc", description="ReDoc endpoint path.")
+    cors_allow_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
+        description=(
+            "Allowed CORS origins for the frontend. Defaults to the local Vite dev "
+            "server. Never use a wildcard '*' default; set explicit origins per "
+            "environment."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +334,25 @@ class SplitterConfig(BaseModel):
 # ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
+# Database (Phase 10 — patient/visit persistence)
+# ---------------------------------------------------------------------------
+
+
+class DatabaseConfig(BaseModel):
+    """SQLite patient-database configuration.
+
+    The effective path is also overridable at runtime by the
+    ``DIALONG_DB_PATH`` environment variable (see ``dialong_automl.db.engine``).
+    """
+
+    db_path: str = Field(
+        "data/dialong_patients.db",
+        description="Path to the SQLite patient database file.",
+    )
+    echo: bool = Field(False, description="Echo SQL statements (debug only).")
+
+
+# ---------------------------------------------------------------------------
 
 
 class AppConfig(BaseModel):
@@ -349,3 +379,4 @@ class AppConfig(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     optuna: OptunaConfig = Field(default_factory=OptunaConfig)
     api: APIConfig = Field(default_factory=APIConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)

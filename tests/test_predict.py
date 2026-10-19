@@ -247,3 +247,89 @@ def test_predict_cli_missing_input_returns_error(trained_artifacts, tmp_path):
         ["--artifact-dir", str(artifact_dir), "--input", str(tmp_path / "nope.json")]
     )
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Incomplete feature sets (regression for the sequence IndexError fix)
+# ---------------------------------------------------------------------------
+
+def _torch_ok() -> bool:
+    try:
+        import torch
+        torch.tensor([1.0])
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+SKIP_TORCH = pytest.mark.skipif(not _torch_ok(), reason="torch unavailable")
+
+
+def test_ensure_feature_columns_adds_missing_without_fabricating():
+    """_ensure_feature_columns adds every canonical feature column; absent
+    numerics become NaN and absent categoricals become None (not invented)."""
+    import numpy as np
+    import pandas as pd
+    from dialong_automl.predict import _ensure_feature_columns
+    from dialong_automl.features.wide import CATEGORICAL_FEATURES, NUMERIC_FEATURES
+
+    df = pd.DataFrame([{"patient_id": "P", "visit_date": pd.Timestamp("2020-01-01"), "hba1c": 5.6}])
+    out = _ensure_feature_columns(df)
+    for col in NUMERIC_FEATURES:
+        assert col in out.columns
+    for col in CATEGORICAL_FEATURES:
+        assert col in out.columns
+    # Present value preserved; missing numerics are NaN; missing categoricals None.
+    assert out.loc[0, "hba1c"] == 5.6
+    assert bool(np.isnan(out.loc[0, "bmi"]))
+    assert out.loc[0, "sex"] is None
+
+
+@pytest.fixture()
+def gru_artifacts(tmp_path):
+    """Train a tiny GRU (sequence) model and return its artifact directory."""
+    if not _torch_ok():
+        pytest.skip("torch unavailable")
+    from dialong_automl.training.pipeline import TrainingPipeline
+
+    csv = _tiny_full_csv(tmp_path, n_patients=90)
+    cfg = _tiny_cfg(tmp_path)
+    cfg.model.enabled_models = ["gru"]
+    cfg.gru.epochs = 2
+    cfg.gru.patience = 2
+    cfg.optuna.study_name = "predict_gru_test_study"
+    TrainingPipeline(cfg, full_csv_path=csv).run()
+    return Path(cfg.paths.artifacts_dir)
+
+
+@SKIP_TORCH
+def test_sequence_prediction_with_partial_features_does_not_crash(gru_artifacts):
+    """Regression: a partial trajectory (missing many clinical fields) must not
+    raise an IndexError in the sequence preprocessor; it should return a valid
+    probability because missing features are imputed by the fitted preprocessor."""
+    partial = [
+        {"visit_date": "2019-02-11", "hba1c": 5.6, "sex": "F"},
+        {"visit_date": "2019-08-19", "hba1c": 5.8, "sex": "F"},
+    ]
+    result = predict_from_artifacts(gru_artifacts, "P_PARTIAL", partial)
+    assert result["representation"] == "sequence"
+    assert 0.0 <= result["probability"] <= 1.0
+    assert result["prediction"] in (0, 1)
+
+
+@SKIP_TORCH
+def test_sequence_prediction_with_full_features_still_works(gru_artifacts):
+    """A complete trajectory continues to work after the fix."""
+    result = predict_from_artifacts(gru_artifacts, "P_FULL", _example_visits())
+    assert result["representation"] == "sequence"
+    assert 0.0 <= result["probability"] <= 1.0
+
+
+@SKIP_LGBM
+def test_wide_prediction_with_partial_features_works(trained_artifacts):
+    """The wide path also accepts a partial trajectory (imputed), unchanged by the fix."""
+    artifact_dir, _csv, _cfg = trained_artifacts
+    partial = [{"visit_date": "2019-02-11", "hba1c": 5.6}, {"visit_date": "2019-08-19", "hba1c": 5.8}]
+    result = predict_from_artifacts(artifact_dir, "P", partial)
+    assert result["representation"] == "wide"
+    assert 0.0 <= result["probability"] <= 1.0
