@@ -130,6 +130,14 @@ class GRUModel(BaseModel):
         len_t = torch.tensor(lengths, dtype=torch.long, device=self._device)
 
         has_val = X_val is not None and y_val is not None
+        if has_val and len(np.unique(np.asarray(y_val))) < 2:
+            # Early stopping / checkpoint restoration use validation AUROC, which
+            # is undefined for a single class. Silently scoring 0.5 would restore
+            # the epoch-0 weights, so refuse instead.
+            raise ValueError(
+                "GRU early stopping needs validation labels containing both classes; "
+                "got a single class."
+            )
         if has_val:
             lv = (mask_val.sum(axis=1) if mask_val is not None else
                   np.full(len(X_val), X_val.shape[1])).astype(np.int32)
@@ -162,10 +170,17 @@ class GRUModel(BaseModel):
                 else:
                     no_improve += 1
                 if trial is not None:
+                    # Report the intermediate value and, if the pruner asks for
+                    # it, ABORT the trial by raising TrialPruned.  Returning a
+                    # partially trained model here would let Optuna record the
+                    # trial as COMPLETE with a partial score (Phase 13B fix).
                     import optuna
                     trial.report(val_auroc, epoch)
                     if trial.should_prune():
-                        break
+                        raise optuna.exceptions.TrialPruned(
+                            f"GRU trial pruned at epoch {epoch} "
+                            f"(intermediate val AUROC={val_auroc:.4f})."
+                        )
                 if no_improve >= patience:
                     break
 

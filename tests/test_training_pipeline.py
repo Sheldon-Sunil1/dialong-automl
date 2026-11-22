@@ -326,10 +326,12 @@ def test_test_labels_not_used_for_threshold_selection(tmp_path):
     # threshold selection
     import dialong_automl.training.pipeline as _pipe_mod
     src = inspect.getsource(_pipe_mod)
-    # Verify threshold is taken from cfg, not computed from test labels
-    assert "threshold = self.cfg.training.threshold" in src, (
-        "Threshold should be read from config, not computed from test data"
-    )
+    # Phase 13B: the threshold comes from select_decision_threshold(), which is
+    # given the validation labels/probabilities only (never y_test).
+    assert "select_decision_threshold(" in src
+    call = src[src.index("select_decision_threshold(\n"):]
+    call = call[: call.index(")\n")]
+    assert "y_test" not in call and "test_" not in call
 
     # run_summary also records the threshold
     summary_path = Path(result.artifact_paths["run_summary"])

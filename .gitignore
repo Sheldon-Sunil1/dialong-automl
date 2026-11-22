@@ -132,3 +132,9 @@ desktop.ini
 *.bak
 *.swp
 *~
+
+# Local secrets and raw third-party datasets (never commit)
+.kiro/settings/mcp.json
+data/real/
+*.csv.gz
+*.zip

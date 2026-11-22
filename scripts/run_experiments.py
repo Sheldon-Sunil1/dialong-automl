@@ -200,9 +200,20 @@ def main(argv: list[str] | None = None) -> int:
         "representation": result.best_representation,
         "best_hyperparams": result.best_hyperparams,
         "validation_auroc_best": result.best_val_auroc,
+        # Genuine held-out validation metrics (best search model, fitted on train only).
         "validation_metrics": {
             k: v for k, v in result.val_metrics.items() if not isinstance(v, dict)
         },
+        # Final retrained model on validation patients that were in its training
+        # data: resubstitution performance, NOT held-out validation.
+        "retrain_resubstitution_metrics": {
+            k: v for k, v in result.resubstitution_metrics.items()
+            if not isinstance(v, dict)
+        },
+        "threshold": result.threshold,
+        "threshold_selection": result.threshold_selection,
+        "optuna_study_name": result.study_name,
+        "optuna_study_identity_hash": result.study_identity_hash,
         "test_metrics": {
             k: v for k, v in result.test_metrics.items() if not isinstance(v, dict)
         },

@@ -17,7 +17,25 @@ Test-set protection rules (enforced throughout this file)
 
 5. Model selection criterion: validation AUROC only.
 
-6. Threshold is always 0.5 (configurable) and never tuned on the test set.
+6. The decision threshold follows ``training.threshold_strategy``:
+   ``fixed`` uses ``training.threshold``; ``validation_f1`` maximises F1 on the
+   VALIDATION split using the best search model's pre-retrain predictions. The
+   threshold is fixed BEFORE the test set is evaluated and is never tuned on it.
+
+7. Metric labelling (Phase 13B):
+   ``validation_metrics`` / ``val_*``  = best search model (fitted on TRAIN only),
+                                         evaluated on the validation split.
+                                         NOT unbiased: that split also drives model
+                                         selection, GRU early stopping and the
+                                         validation_f1 threshold.
+   ``retrain_resubstitution_metrics`` / ``resub_*`` = the FINAL retrained model
+                                         evaluated on the validation patients,
+                                         which were part of its training data.
+                                         These are NOT held-out performance.
+   ``test_metrics`` / ``test_*``       = final model on the untouched test split.
+
+8. Optuna studies are isolated by an identity hash (dataset content, cohort,
+   split, search configuration, seeds, optional run id).
 
 Pipeline steps
 --------------
@@ -37,6 +55,7 @@ Pipeline steps
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -52,7 +71,8 @@ from dialong_automl.config.schema import AppConfig
 from dialong_automl.data.cohort import CohortBuilder, CohortConfig, CohortMode
 from dialong_automl.data.loader import load_longitudinal_csv
 from dialong_automl.data.splitter import PatientSplitter, SplitConfig
-from dialong_automl.evaluation.metrics import evaluate, metrics_to_jsonable, select_threshold_by_f1
+from dialong_automl.evaluation.metrics import evaluate
+from dialong_automl.evaluation.threshold import select_decision_threshold
 from dialong_automl.features.preprocessing import SequencePreprocessor, WidePreprocessor
 from dialong_automl.features.sequence import SequenceRepresentationBuilder
 from dialong_automl.features.wide import WideRepresentationBuilder
@@ -83,10 +103,13 @@ class PipelineResult:
     best_hyperparams: dict[str, Any]
     best_val_auroc: float | None
 
-    # Validation metrics (best model, before retrain)
+    # Validation metrics: best search model (fitted on TRAIN only) on the validation
+    # split, before the final retrain. Keys: val_*. NOT an unbiased estimate of
+    # generalisation: the same split drives model/threshold selection and GRU
+    # early stopping (see VALIDATION_METRICS_SOURCE).
     val_metrics: dict[str, Any]
 
-    # Final test metrics (after retrain on train+val, evaluated once)
+    # Final test metrics (after retrain on train+val, evaluated once). Keys: test_*.
     test_metrics: dict[str, Any]
 
     # Timing
@@ -100,6 +123,28 @@ class PipelineResult:
     # Optuna summary
     n_trials_completed: int = 0
     n_trials_total: int = 0
+
+    # Metrics of the FINAL retrained model on the validation patients. These
+    # patients were (wholly or partly) in its training data, so this is
+    # resubstitution performance, NOT held-out validation. Keys: resub_*.
+    resubstitution_metrics: dict[str, Any] = field(default_factory=dict)
+
+    # Decision threshold used for threshold-dependent metrics, and how it was chosen.
+    threshold: float = 0.5
+    threshold_selection: dict[str, Any] = field(default_factory=dict)
+
+    # Optuna study provenance.
+    study_name: str | None = None
+    study_identity_hash: str | None = None
+    n_trials_failed: int = 0
+    failed_trials: list[dict[str, Any]] = field(default_factory=list)
+
+    # How the final model was retrained (see _retrain_policy_* helpers).
+    retrain_policy: dict[str, Any] = field(default_factory=dict)
+
+    # Phase 13C reference baselines (fixed comparators, never selectable).
+    # {"enabled": False} when disabled; otherwise BaselineRunner.to_dict().
+    baselines: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = [
@@ -281,6 +326,74 @@ def _internal_patient_split(
     return pids[train_sel].tolist(), pids[val_sel].tolist()
 
 
+SEARCH_IDENTITY_VERSION = "13b1-1"
+
+VALIDATION_METRICS_SOURCE = (
+    "Best Optuna trial's model, fitted on the TRAIN split only, evaluated on the "
+    "validation split before the final retrain. These patients were not in that "
+    "model's training data, but the validation split was ALSO used for model and "
+    "hyperparameter selection, GRU early stopping / checkpoint restoration, and "
+    "(for threshold_strategy='validation_f1') threshold selection. These metrics "
+    "are therefore optimistically biased and are NOT an unbiased estimate of "
+    "generalisation performance; only test_metrics are untouched by selection."
+)
+LIMITATIONS_VALIDATION = (
+    "Validation split used for model selection, GRU early stopping and (optionally) "
+    "threshold selection; validation metrics are not unbiased estimates of "
+    "generalisation. The threshold is derived from pre-retrain model probabilities "
+    "and applied to the final retrained model."
+)
+RESUBSTITUTION_NOTE = (
+    "Final retrained model evaluated on the validation patients, which were part "
+    "of its training data. This is resubstitution performance, NOT held-out "
+    "validation performance. Do not report it as validation or generalisation."
+)
+
+
+def file_sha256(path: str | Path, chunk_size: int = 1 << 20) -> str:
+    """SHA-256 of a file's CONTENT (independent of its path)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_search_identity(cfg: AppConfig, dataset_sha256: str) -> dict[str, Any]:
+    """Describe everything that determines the outcome of the Optuna search.
+
+    The result is hashed into the effective study name, so two runs share a
+    persisted study only if the dataset content, cohort, split, search
+    configuration, seeds and optional ``optuna.run_id`` are all identical.
+
+    Deliberately excluded: ``n_trials`` and ``timeout_seconds`` (so an
+    intentional resume may extend a study), ``storage`` (location only) and
+    ``training.threshold_strategy`` (applied after the search).
+    """
+    return {
+        "identity_version": SEARCH_IDENTITY_VERSION,
+        "dataset_sha256": dataset_sha256,
+        "cohort": cfg.cohort.model_dump(mode="json"),
+        "split": cfg.split.model_dump(mode="json"),
+        "training": {
+            "seed": cfg.training.seed,
+            "threshold": cfg.training.threshold,
+            "max_iter_sklearn": cfg.training.max_iter_sklearn,
+        },
+        "gru": cfg.gru.model_dump(mode="json"),
+        "model": cfg.model.model_dump(mode="json"),
+        "optuna": {
+            "base_study_name": cfg.optuna.study_name,
+            "seed": cfg.optuna.seed,
+            "direction": cfg.optuna.direction,
+            "metric": cfg.optuna.metric,
+            "sampler": cfg.optuna.sampler,
+            "pruner": cfg.optuna.pruner,
+            "run_id": cfg.optuna.run_id,
+        },
+    }
+
+
 class TrainingPipeline:
     """Canonical end-to-end training pipeline.
 
@@ -341,6 +454,7 @@ class TrainingPipeline:
             )
         full_df = load_longitudinal_csv(self._full_csv_path)
         logger.info("  Loaded %d rows, %d patients", len(full_df), full_df["patient_id"].nunique())
+        dataset_sha256 = file_sha256(self._full_csv_path)
 
         # ------------------------------------------------------------------
         # Step 2: Build future-outcome cohort
@@ -493,6 +607,10 @@ class TrainingPipeline:
             seed=self.cfg.optuna.seed,
             storage=storage,
             study_name=self.cfg.optuna.study_name,
+            identity=build_search_identity(self.cfg, dataset_sha256),
+            resume=self.cfg.optuna.resume,
+            sampler=self.cfg.optuna.sampler,
+            pruner=self.cfg.optuna.pruner,
             direction=self.cfg.optuna.direction,
             timeout_seconds=self.cfg.optuna.timeout_seconds,
             enabled_models=self.cfg.model.enabled_models,
@@ -516,6 +634,18 @@ class TrainingPipeline:
         )
         optuna_seconds = time.perf_counter() - t_optuna_start
 
+        # Failed trials (not pruned!) are reported, never silently dropped.
+        failed_trials = optimizer.failed_trials()
+        failed_trials_path: Path | None = None
+        if failed_trials:
+            failed_trials_path = Path(self.cfg.paths.outputs_dir) / "failed_trials.json"
+            with open(failed_trials_path, "w", encoding="utf-8") as fh:
+                json.dump(failed_trials, fh, indent=2, default=str)
+            logger.warning(
+                "%d Optuna trial(s) FAILED; diagnostics in %s",
+                len(failed_trials), failed_trials_path,
+            )
+
         # ------------------------------------------------------------------
         # Step 8: Save leaderboard + best_config
         # ------------------------------------------------------------------
@@ -533,7 +663,32 @@ class TrainingPipeline:
         best_representation = best.representation
         best_hyperparams = best.hyperparams
         best_val_auroc = best.val_auroc
-        val_metrics_search = best.val_auroc  # from Optuna search
+
+        # --------------------------------------------------------------
+        # Decision threshold: chosen NOW, from validation data only, before
+        # the final retrain and long before the test set is touched.
+        # --------------------------------------------------------------
+        if best.val_proba is None or len(best.val_proba) != len(y_val):
+            raise RuntimeError(
+                "Best trial has no validation predictions aligned with the "
+                "validation labels; cannot report genuine validation metrics."
+            )
+        best_val_proba = np.asarray(best.val_proba, dtype=np.float64)
+        threshold_selection = select_decision_threshold(
+            self.cfg.training.threshold_strategy,
+            self.cfg.training.threshold,
+            y_validation=y_val,
+            proba_validation=best_val_proba,
+        )
+        threshold = float(threshold_selection["threshold"])
+        logger.info(
+            "  Threshold (%s) = %.3f, selected on: %s",
+            threshold_selection["strategy"], threshold, threshold_selection["selected_on"],
+        )
+
+        # GENUINE validation metrics: the best trial's model was fitted on the
+        # TRAIN split only and has never seen these validation patients.
+        val_metrics = evaluate(y_val, best_val_proba, threshold=threshold, prefix="val_")
 
         logger.info(
             "  Best: %s (val_auroc=%.4f)", best_model_name, best_val_auroc or 0.0
@@ -563,6 +718,19 @@ class TrainingPipeline:
             # Labels aligned to the builder's row order (not the concat order
             # of the shuffled splitter targets).
             y_trainval = _aligned_labels(train_val_wide, "train+val")
+            retrain_policy = {
+                "model": best_model_name,
+                "policy": "refit_on_train_plus_validation",
+                "hyperparameters": "selected search hyperparameters, unchanged",
+                "training_pool": "train + validation patients (all)",
+                "preprocessor_fit_on": "train + validation patients",
+                "early_stopping": "none (non-iterative / fixed-size model)",
+                "test_set_used": False,
+                "differences_from_search": [
+                    "training patients: train+validation instead of the train split",
+                    "preprocessor statistics re-estimated on train+validation",
+                ],
+            }
         else:
             # Sequence (GRU) retrain.
             #
@@ -583,12 +751,28 @@ class TrainingPipeline:
                 val_fraction=self.cfg.split.validation_size
                 / (self.cfg.split.train_size + self.cfg.split.validation_size),
                 seed=self.cfg.split.random_seed,
-                stratify=self.cfg.split.stratify,
+                # Always label-stratified (when both classes exist), regardless of
+                # split.stratify: the internal holdout drives early stopping and
+                # must contain both classes. This does not change the outer
+                # train/validation/test partitions.
+                stratify=True,
             )
             self._last_internal_split = (
                 list(internal_train_ids),
                 list(internal_val_ids),
             )
+            # Early stopping scores validation AUROC, which is undefined for a
+            # single class (it would silently restore the epoch-0 weights).
+            if train_val_targets.nunique() >= 2:
+                for part, ids in (
+                    ("internal-train", internal_train_ids),
+                    ("internal-validation", internal_val_ids),
+                ):
+                    if train_val_targets.loc[ids].nunique() < 2:
+                        raise RuntimeError(
+                            f"GRU retrain {part} partition contains a single class; "
+                            "early stopping would be undefined."
+                        )
 
             itrain_df = train_val_df[
                 train_val_df["patient_id"].isin(internal_train_ids)
@@ -630,6 +814,44 @@ class TrainingPipeline:
             mask_internal_val = ival_seq.mask
             lengths_internal_val = _lengths(ival_seq.mask)
 
+            # The retrained network must see exactly the same input layout as the
+            # architecture that was selected in the search.
+            if (
+                list(itrain_seq.feature_names) != list(train_seq.feature_names)
+                or X_trainval.shape[1:] != X_train_seq.shape[1:]
+            ):
+                raise RuntimeError(
+                    "GRU retrain input layout differs from the search layout "
+                    f"({X_trainval.shape[1:]} vs {X_train_seq.shape[1:]}); the selected "
+                    "architecture would not match."
+                )
+
+            retrain_policy = {
+                "model": best_model_name,
+                "policy": "internal_holdout_early_stopping",
+                "hyperparameters": "selected search hyperparameters, unchanged "
+                                   "(including epochs, patience and seed)",
+                "training_pool": "train + validation patients",
+                "internal_split": {
+                    "stratified_by_label": True,
+                    "seed": self.cfg.split.random_seed,
+                    "holdout_fraction_of_pool": round(len(internal_val_ids) / len(tv_patients), 4),
+                    "n_internal_train": len(internal_train_ids),
+                    "n_internal_validation": len(internal_val_ids),
+                },
+                "preprocessor_fit_on": "internal-train patients only",
+                "vocabulary_from": "original train split",
+                "early_stopping": "validation AUROC on the internal holdout; "
+                                  "best-epoch weights restored",
+                "test_set_used": False,
+                "differences_from_search": [
+                    "training patients: a stratified share of train+validation instead of "
+                    "the train split",
+                    "early-stopping data: the internal holdout instead of the validation split",
+                    "preprocessor statistics re-estimated on the internal-train patients",
+                ],
+            }
+
         final_model = build_model(best_model_name, best_hyperparams)
 
         if best_model_name == "gru":
@@ -654,7 +876,8 @@ class TrainingPipeline:
         # Step 10: Final test evaluation — exactly once
         # ------------------------------------------------------------------
         logger.info("Step 10/10: Final test evaluation (one-time, never repeated)")
-        threshold = self.cfg.training.threshold
+        # `threshold` was fixed during model selection (validation data only)
+        # and is applied to the test set unchanged.
 
         t_inf = time.perf_counter()
         if best_model_name == "gru":
@@ -667,7 +890,10 @@ class TrainingPipeline:
 
         test_metrics = evaluate(y_test, test_proba, threshold=threshold, prefix="test_")
 
-        # Also compute final val metrics on retrained model for reporting
+        # Final retrained model on the validation patients. These patients were
+        # in its training data (fully for wide models; partly for the GRU's
+        # internal split), so this is RESUBSTITUTION performance and is reported
+        # under its own "resub_" prefix, never as validation performance.
         if best_representation == REPRESENTATION_WIDE:
             val_proba_final = final_model.predict_proba(
                 final_wide_prep.transform(val_wide.X)
@@ -677,8 +903,8 @@ class TrainingPipeline:
                 final_seq_prep.transform(val_seq.X, val_seq.mask),
                 val_seq.mask,
             )
-        val_metrics = evaluate(
-            y_val, val_proba_final, threshold=threshold, prefix="val_"
+        resub_metrics = evaluate(
+            y_val, val_proba_final, threshold=threshold, prefix="resub_"
         )
 
         logger.info(
@@ -687,6 +913,25 @@ class TrainingPipeline:
             test_metrics.get("test_auprc") or 0.0,
             test_metrics.get("test_f1") or 0.0,
         )
+
+        # ------------------------------------------------------------------
+        # Reference baselines B0-B3 (Phase 13C) — same patients, same policy
+        # ------------------------------------------------------------------
+        if self.cfg.baselines.enabled:
+            baselines_record = self._run_baselines(
+                wide_builder=wide_builder,
+                split=split,
+                train_wide=train_wide,
+                val_wide=val_wide,
+                test_wide=test_wide,
+                y_train=y_train,
+                y_val=y_val,
+                y_test=y_test,
+                train_val_df=train_val_df,
+                train_val_targets=train_val_targets,
+            )
+        else:
+            baselines_record = {"enabled": False}
 
         # ------------------------------------------------------------------
         # Save artefacts
@@ -715,6 +960,7 @@ class TrainingPipeline:
             json.dump(train_seq.categorical_vocabularies, fh, indent=2)
 
         # Model metadata
+        study_hash = best_cfg.get("study_identity_hash")
         total_seconds = time.perf_counter() - t_total_start
         n_trials_done = len(optimizer.build_leaderboard())
 
@@ -741,14 +987,29 @@ class TrainingPipeline:
             "prediction_horizon_days": self.cfg.cohort.prediction_horizon_days,
             "split_counts": {"train": n_train, "val": n_val, "test": n_test},
             "threshold": threshold,
+            "threshold_strategy": threshold_selection["strategy"],
+            "threshold_selection": threshold_selection,
             "validation_metrics": {
                 k: v for k, v in val_metrics.items()
                 if not isinstance(v, dict)
             },
+            "validation_metrics_source": VALIDATION_METRICS_SOURCE,
+            "retrain_resubstitution_metrics": {
+                k: v for k, v in resub_metrics.items()
+                if not isinstance(v, dict)
+            },
+            "retrain_resubstitution_metrics_note": RESUBSTITUTION_NOTE,
             "test_metrics": {
                 k: v for k, v in test_metrics.items()
                 if not isinstance(v, dict)
             },
+            "retrain_policy": retrain_policy,
+            "optuna_study_name": optimizer.study_name,
+            "optuna_study_identity_hash": study_hash,
+            "optuna_sampler": optimizer.sampler_name,
+            "optuna_pruner": optimizer.pruner_name,
+            "optuna_n_trials_failed": len(failed_trials),
+            "optuna_trial_states": optimizer.trial_state_counts(),
             "optuna_n_trials_completed": n_trials_done,
             "optuna_selection_criterion": "validation_auroc",
             "test_set_accessed_for_selection": False,
@@ -758,8 +1019,10 @@ class TrainingPipeline:
                 "Not validated on real patient data.",
                 "No clinical safety evaluation performed.",
                 "GRU trained on CPU; production would benefit from GPU.",
+                LIMITATIONS_VALIDATION,
             ],
         }
+        metadata["baselines"] = baselines_record
         meta_path = artifacts_dir / "model_metadata.json"
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump(metadata, fh, indent=2, default=str)
@@ -784,10 +1047,26 @@ class TrainingPipeline:
             "representation": best_representation,
             "n_trials_completed": n_trials_done,
             "validation_auroc_best": best_val_auroc,
+            "threshold": threshold,
+            "threshold_selection": threshold_selection,
             "validation_metrics": {
                 k: v for k, v in val_metrics.items()
                 if not isinstance(v, dict)
             },
+            "validation_metrics_source": VALIDATION_METRICS_SOURCE,
+            "retrain_resubstitution_metrics": {
+                k: v for k, v in resub_metrics.items()
+                if not isinstance(v, dict)
+            },
+            "retrain_resubstitution_metrics_note": RESUBSTITUTION_NOTE,
+            "retrain_policy": retrain_policy,
+            "optuna_study_name": optimizer.study_name,
+            "optuna_study_identity_hash": study_hash,
+            "optuna_sampler": optimizer.sampler_name,
+            "optuna_pruner": optimizer.pruner_name,
+            "optuna_n_trials_failed": len(failed_trials),
+            "optuna_trial_states": optimizer.trial_state_counts(),
+            "limitations": [LIMITATIONS_VALIDATION],
             "test_metrics": {
                 k: v for k, v in test_metrics.items()
                 if not isinstance(v, dict)
@@ -797,9 +1076,24 @@ class TrainingPipeline:
             "retrain_seconds": round(retrain_seconds, 2),
             "inf_time_per_patient_seconds": round(inf_per_patient, 6),
         }
+        run_summary["baselines"] = baselines_record
         summary_path = outputs_dir / "run_summary.json"
         with open(summary_path, "w", encoding="utf-8") as fh:
             json.dump(run_summary, fh, indent=2, default=str)
+
+        # Side-by-side table: selected model first, then each baseline.
+        comparison_path: Path | None = None
+        if baselines_record.get("enabled"):
+            from dialong_automl.baselines import comparison_rows
+
+            comparison_path = outputs_dir / "baselines_comparison.csv"
+            pd.DataFrame(comparison_rows(
+                selected_model=best_model_name,
+                model_threshold=threshold,
+                model_val_metrics=val_metrics,
+                model_test_metrics=test_metrics,
+                baseline_results=baselines_record["results"],
+            )).to_csv(comparison_path, index=False)
 
         artifact_paths = {
             "best_model": str(model_path),
@@ -811,6 +1105,10 @@ class TrainingPipeline:
             "test_metrics": str(test_metrics_path),
             "run_summary": str(summary_path),
         }
+        if failed_trials_path is not None:
+            artifact_paths["failed_trials"] = str(failed_trials_path)
+        if comparison_path is not None:
+            artifact_paths["baselines_comparison"] = str(comparison_path)
         if storage:
             artifact_paths["optuna_study_db"] = storage
 
@@ -833,7 +1131,69 @@ class TrainingPipeline:
             artifact_paths=artifact_paths,
             n_trials_completed=n_trials_done,
             n_trials_total=self.cfg.optuna.n_trials,
+            resubstitution_metrics=resub_metrics,
+            threshold=threshold,
+            threshold_selection=threshold_selection,
+            study_name=optimizer.study_name,
+            study_identity_hash=study_hash,
+            n_trials_failed=len(failed_trials),
+            failed_trials=failed_trials,
+            retrain_policy=retrain_policy,
+            baselines=baselines_record,
         )
 
         logger.info("Pipeline complete. %s", result.summary())
         return result
+
+    # ------------------------------------------------------------------
+    # Reference baselines (Phase 13C)
+    # ------------------------------------------------------------------
+
+    def _run_baselines(
+        self,
+        *,
+        wide_builder: WideRepresentationBuilder,
+        split: Any,
+        train_wide: Any,
+        val_wide: Any,
+        test_wide: Any,
+        y_train: np.ndarray,
+        y_val: np.ndarray,
+        y_test: np.ndarray,
+        train_val_df: pd.DataFrame,
+        train_val_targets: pd.Series,
+    ) -> dict[str, Any]:
+        """Fit B0-B3 with the selected model's policy and return the record.
+
+        Fit on train, threshold on validation, refit on train + validation,
+        then score the test split once. Uses the pipeline's own patient
+        partitions and builder-aligned labels, so baselines and the selected
+        model are scored on exactly the same patients. Test inputs are only
+        constructed for the final ``evaluate_test`` call.
+        """
+        from dialong_automl.baselines import BaselineInputs, BaselineRunner
+
+        logger.info("Reference baselines B0-B3: fit on train, threshold on validation")
+        runner = BaselineRunner.from_config(self.cfg)
+        runner.fit_and_validate(
+            BaselineInputs(train_wide.X, list(train_wide.patient_ids), split.train_df, y_train),
+            BaselineInputs(val_wide.X, list(val_wide.patient_ids), split.validation_df, y_val),
+        )
+
+        tv_wide = wide_builder.build(train_val_df, train_val_targets)
+        runner.refit(BaselineInputs(
+            tv_wide.X, list(tv_wide.patient_ids), train_val_df,
+            _aligned_labels(tv_wide, "train+val (baselines)"),
+        ))
+
+        runner.evaluate_test(
+            BaselineInputs(test_wide.X, list(test_wide.patient_ids), split.test_df, y_test)
+        )
+        record = runner.to_dict()
+        for name, r in record["results"].items():
+            logger.info(
+                "  %-24s val_auroc=%s test_auroc=%s threshold=%.4f",
+                name, r["validation_metrics"].get("val_auroc"),
+                r["test_metrics"].get("test_auroc"), r["threshold"],
+            )
+        return record
