@@ -6,7 +6,10 @@ only one class in y_true), the function returns ``None`` rather than
 raising or returning a fabricated value.
 
 AUROC and AUPRC are implemented in pure NumPy to avoid dependency on
-sklearn compiled extensions (which may be blocked by OS policy).
+sklearn compiled extensions (which may be blocked by OS policy). Tied scores
+are grouped into one threshold, so results do not depend on row order, and
+AUPRC is the step-wise average precision. Both match scikit-learn's
+``roc_auc_score`` / ``average_precision_score`` (Phase 13C, RE-7).
 
 Default threshold: 0.5 for binary predictions.
 Threshold selection must always use the validation set only.
@@ -34,29 +37,56 @@ logger = logging.getLogger(__name__)
 # Pure-numpy AUC helpers (no sklearn dependency)
 # ---------------------------------------------------------------------------
 
+def _binary_clf_curve(
+    y_true: np.ndarray, y_score: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cumulative (FP, TP) counts at each DISTINCT score threshold, descending.
+
+    Tied scores are grouped into a single threshold, so the result does not
+    depend on the row order of tied samples (Phase 13C, audit item RE-7).
+    Previously every sample was its own threshold, which made e.g. a constant
+    predictor's AUROC vary between roughly 0.2 and 0.7 with the label order.
+    Equivalent to scikit-learn's internal ``_binary_clf_curve``.
+    """
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    order = np.argsort(-y_score, kind="mergesort")
+    y_score = y_score[order]
+    y_true = y_true[order].astype(np.float64)
+    # Index of the last sample of each block of tied scores.
+    distinct = np.where(np.diff(y_score))[0]
+    threshold_idx = np.concatenate([distinct, [y_true.size - 1]])
+    tps = np.cumsum(y_true)[threshold_idx]
+    fps = (threshold_idx + 1) - tps
+    return fps, tps
+
+
 def _roc_curve_numpy(
     y_true: np.ndarray, y_score: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute TPR and FPR for all unique thresholds (pure numpy)."""
-    desc_idx = np.argsort(-y_score)
-    y_true_sorted = y_true[desc_idx]
-    P = int(y_true.sum())
+    """FPR and TPR at every distinct threshold, starting at (0, 0) (pure numpy).
+
+    Ties are grouped (see :func:`_binary_clf_curve`); a block of tied scores
+    contributes a single diagonal segment, i.e. half credit, as in the
+    Mann-Whitney definition of AUROC.
+    """
+    P = int(np.asarray(y_true).sum())
     N = len(y_true) - P
     if P == 0 or N == 0:
         return np.array([0.0, 1.0]), np.array([0.0, 1.0])
-    tp = np.cumsum(y_true_sorted)
-    fp = np.cumsum(1 - y_true_sorted)
-    tpr = tp / P
-    fpr = fp / N
-    # Prepend (0, 0)
-    tpr = np.concatenate([[0.0], tpr])
-    fpr = np.concatenate([[0.0], fpr])
+    fps, tps = _binary_clf_curve(y_true, y_score)
+    fpr = np.concatenate([[0.0], fps / N])
+    tpr = np.concatenate([[0.0], tps / P])
     return fpr, tpr
 
 
 def _auc_trapezoid(x: np.ndarray, y: np.ndarray) -> float:
-    """Trapezoidal AUC — compatible with NumPy 1.x and 2.x."""
-    order = np.argsort(x)
+    """Trapezoidal AUC — compatible with NumPy 1.x and 2.x.
+
+    The sort is STABLE: ROC points with equal x keep their curve order, so a
+    vertical step is never reordered (which would change the area).
+    """
+    order = np.argsort(x, kind="mergesort")
     x, y = x[order], y[order]
     _trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
     return float(_trapz(y, x))
@@ -65,19 +95,17 @@ def _auc_trapezoid(x: np.ndarray, y: np.ndarray) -> float:
 def _precision_recall_curve_numpy(
     y_true: np.ndarray, y_score: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute precision and recall for all unique thresholds (pure numpy)."""
-    desc_idx = np.argsort(-y_score)
-    y_sorted = y_true[desc_idx]
-    P = int(y_true.sum())
+    """Precision and recall at every distinct threshold, descending (pure numpy).
+
+    Ties are grouped (see :func:`_binary_clf_curve`). Recall is
+    non-decreasing along the returned arrays.
+    """
+    P = int(np.asarray(y_true).sum())
     if P == 0:
         return np.array([1.0, 0.0]), np.array([0.0, 1.0])
-    tp = np.cumsum(y_sorted)
-    fp = np.cumsum(1 - y_sorted)
-    prec = tp / (tp + fp)
-    rec = tp / P
-    # Append (recall=0, precision=1) at the end for completeness
-    prec = np.concatenate([prec, [1.0]])
-    rec = np.concatenate([rec, [0.0]])
+    fps, tps = _binary_clf_curve(y_true, y_score)
+    prec = tps / (tps + fps)
+    rec = tps / P
     return prec, rec
 
 
@@ -104,7 +132,14 @@ def auroc(y_true: np.ndarray, y_proba: np.ndarray) -> float | None:
 
 
 def auprc(y_true: np.ndarray, y_proba: np.ndarray) -> float | None:
-    """Area Under the Precision-Recall Curve (pure numpy).
+    """Area under the precision-recall curve as AVERAGE PRECISION (pure numpy).
+
+    ``AP = sum_k (R_k - R_{k-1}) * P_k`` over distinct thresholds, with tied
+    scores grouped. This is the step-wise definition used by scikit-learn's
+    ``average_precision_score``; it gives a constant predictor exactly the
+    prevalence. (Phase 13C, RE-7: the earlier version interpolated the PR
+    curve with the trapezoid rule, which is optimistic and order-dependent
+    under ties.)
 
     Returns ``None`` when y_true contains only one class.
     """
@@ -115,10 +150,8 @@ def auprc(y_true: np.ndarray, y_proba: np.ndarray) -> float | None:
         return None
     try:
         prec, rec = _precision_recall_curve_numpy(y_true, y_proba)
-        # Sort by recall ascending for trapezoid
-        order = np.argsort(rec)
-        _trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
-        return float(_trapz(prec[order], rec[order]))
+        rec_prev = np.concatenate([[0.0], rec[:-1]])
+        return float(np.sum((rec - rec_prev) * prec))
     except Exception as exc:
         logger.warning("AUPRC computation failed: %s", exc)
         return None

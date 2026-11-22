@@ -119,8 +119,68 @@ class ModelConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Values the optimizer actually implements. Anything else is rejected explicitly
+#: so that no OptunaConfig field looks functional while being ignored.
+SUPPORTED_OPTUNA_SAMPLERS: tuple[str, ...] = ("TPESampler", "RandomSampler")
+SUPPORTED_OPTUNA_PRUNERS: tuple[str, ...] = ("MedianPruner", "NopPruner")
+SUPPORTED_OPTUNA_METRICS: tuple[str, ...] = ("roc_auc",)
+SUPPORTED_OPTUNA_DIRECTIONS: tuple[str, ...] = ("maximize",)
+
+
 class OptunaConfig(BaseModel):
-    """Optuna AutoML search configuration."""
+    """Optuna AutoML search configuration.
+
+    Every field is applied by ``AutoMLOptimizer``. Unsupported values are
+    rejected at validation time (Phase 13B.1).
+    """
+
+    @field_validator("sampler")
+    @classmethod
+    def _validate_sampler(cls, v: str) -> str:
+        if v not in SUPPORTED_OPTUNA_SAMPLERS:
+            raise ValueError(
+                f"optuna.sampler must be one of {SUPPORTED_OPTUNA_SAMPLERS}, got {v!r}"
+            )
+        return v
+
+    @field_validator("pruner")
+    @classmethod
+    def _validate_pruner(cls, v: str) -> str:
+        if v not in SUPPORTED_OPTUNA_PRUNERS:
+            raise ValueError(
+                f"optuna.pruner must be one of {SUPPORTED_OPTUNA_PRUNERS}, got {v!r}"
+            )
+        return v
+
+    @field_validator("metric")
+    @classmethod
+    def _validate_metric(cls, v: str) -> str:
+        if v not in SUPPORTED_OPTUNA_METRICS:
+            raise ValueError(
+                f"optuna.metric must be one of {SUPPORTED_OPTUNA_METRICS} "
+                f"(the objective is validation AUROC), got {v!r}"
+            )
+        return v
+
+    @field_validator("direction")
+    @classmethod
+    def _validate_direction(cls, v: str) -> str:
+        if v not in SUPPORTED_OPTUNA_DIRECTIONS:
+            raise ValueError(
+                f"optuna.direction must be one of {SUPPORTED_OPTUNA_DIRECTIONS} "
+                f"(best-trial selection maximises validation AUROC), got {v!r}"
+            )
+        return v
+
+    @field_validator("n_jobs")
+    @classmethod
+    def _validate_n_jobs(cls, v: int) -> int:
+        if v != 1:
+            raise ValueError(
+                "optuna.n_jobs must be 1: parallel trials are not supported "
+                "(they would break seeded reproducibility and trial bookkeeping)."
+            )
+        return v
 
     n_trials: int = Field(5, description="Number of Optuna trials (demo default=5).")
     timeout_seconds: int | None = Field(
@@ -141,7 +201,30 @@ class OptunaConfig(BaseModel):
         description="Optuna storage URL. E.g. 'sqlite:///artifacts/optuna_study.db'.",
     )
     study_name: str = Field(
-        "dialong_automl_study", description="Optuna study name (for SQLite persistence)."
+        "dialong_automl_study",
+        description=(
+            "Base Optuna study name. The effective study name is "
+            "'<study_name>__<identity hash>' where the hash covers the dataset "
+            "content, cohort/split/search configuration and seeds, so unrelated "
+            "experiments can never share trials (Phase 13B)."
+        ),
+    )
+    run_id: str | None = Field(
+        None,
+        description=(
+            "Optional run/fold label included in the study identity. Use a "
+            "different value to start an independent study for an otherwise "
+            "identical configuration (for example one per fold or repeat)."
+        ),
+    )
+    resume: bool = Field(
+        False,
+        description=(
+            "When False (default) a persisted study with the same identity must "
+            "not already exist. When True the existing study is resumed and "
+            "'n_trials' is interpreted as the TOTAL number of trials. Requires "
+            "persistent 'storage'."
+        ),
     )
 
 
@@ -361,6 +444,49 @@ class EvaluationConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Reference baselines (Phase 13C)
+# ---------------------------------------------------------------------------
+
+
+class BaselinesConfig(BaseModel):
+    """Fixed, pre-specified reference baselines B0-B3 (``dialong_automl.baselines``).
+
+    Baselines are reported next to the selected model and are NEVER Optuna
+    candidates or selectable models. Their parameters are fixed here in
+    advance and are not tuned on any data; only the decision threshold is
+    chosen, on validation data, exactly like the selected model's.
+    """
+
+    enabled: bool = Field(
+        True, description="Fit and report the reference baselines in every training run."
+    )
+    b2_horizon_days: int | None = Field(
+        None,
+        description=(
+            "Extrapolation horizon for B2 in days. None = cohort.prediction_horizon_days."
+        ),
+    )
+    b3_c: float = Field(
+        1.0,
+        description="Fixed inverse L2 regularisation strength (C) for the B3 regressions.",
+    )
+
+    @field_validator("b2_horizon_days")
+    @classmethod
+    def _validate_horizon(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError(f"baselines.b2_horizon_days must be positive, got {v}")
+        return v
+
+    @field_validator("b3_c")
+    @classmethod
+    def _validate_c(cls, v: float) -> float:
+        if not v > 0:
+            raise ValueError(f"baselines.b3_c must be positive, got {v}")
+        return v
+
+
+# ---------------------------------------------------------------------------
 # Database (Phase 10 — patient/visit persistence)
 # ---------------------------------------------------------------------------
 
@@ -408,3 +534,5 @@ class AppConfig(BaseModel):
     api: APIConfig = Field(default_factory=APIConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    # Phase 13C: reference baselines (not part of the Optuna study identity).
+    baselines: BaselinesConfig = Field(default_factory=BaselinesConfig)
