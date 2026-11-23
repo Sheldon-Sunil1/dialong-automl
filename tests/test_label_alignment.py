@@ -338,6 +338,7 @@ def test_pipeline_wide_retrain_labels_aligned(tmp_path):
 
     csv = _tiny_full_csv(tmp_path)
     cfg = _tiny_cfg(tmp_path, "lightgbm")
+    cfg.reliability.ensemble_members = 0   # members (Phase 14E) would add later fits
 
     fit_calls: list = []
     real_fit = lgbm_mod.LightGBMModel.fit

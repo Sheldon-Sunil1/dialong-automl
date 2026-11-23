@@ -50,6 +50,31 @@ class PredictRequest(BaseModel):
     )
 
 
+class FlagModel(BaseModel):
+    code: str
+    severity: str = Field(..., description="severe | moderate | info")
+    message: str
+
+
+class ReliabilityInfo(BaseModel):
+    """Phase 14 reliability layer. Absent (null) for artifacts trained before 14E."""
+
+    level: str = Field(..., description="Low | Moderate | High (relative to this model).")
+    reasons: list[str] = Field(default_factory=list, description="Plain-language reasons.")
+    flags: list[FlagModel] = Field(default_factory=list)
+    calibrated_probability: float = Field(..., ge=0.0, le=1.0)
+    calibrated_threshold: float
+    prediction_set: str = Field(..., description="no_onset | onset | undecided | empty")
+    conformal_coverage_target: float
+    range_low: float | None = Field(None, description="Model-variability range, 10th pct.")
+    range_high: float | None = Field(None, description="Model-variability range, 90th pct.")
+    range_note: str
+    ood_percentile: float | None = None
+    ood_category: str | None = None
+    method: dict[str, Any] = Field(default_factory=dict)
+    note: str
+
+
 class PredictResponse(BaseModel):
     """Prediction result for a single patient trajectory."""
 
@@ -60,6 +85,8 @@ class PredictResponse(BaseModel):
     model: str = Field(..., description="Selected model name.")
     representation: str = Field(..., description="Feature representation (wide/sequence).")
     n_visits: int = Field(..., description="Number of visits scored.")
+    reliability: ReliabilityInfo | None = Field(
+        None, description="Reliability of this prediction; null for pre-Phase-14E artifacts.")
     disclaimer: str = Field(..., description="Synthetic-data / non-clinical disclaimer.")
 
 

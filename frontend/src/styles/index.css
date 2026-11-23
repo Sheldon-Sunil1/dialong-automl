@@ -203,3 +203,11 @@ body {
   .kv { grid-template-columns: 1fr; }
   .app__header { flex-direction: column; align-items: flex-start; }
 }
+
+/* Phase 14E reliability panel */
+.reliability { margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid #ddd; }
+.reliability h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+.reliability__level { padding: 0.4rem 0.6rem; border-radius: 4px; }
+.reliability__level--high { background: #e6f4ea; }
+.reliability__level--moderate { background: #fff4e0; }
+.reliability__level--low { background: #fde8e8; }

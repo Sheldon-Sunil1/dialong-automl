@@ -42,9 +42,9 @@ import pandas as pd
 
 from dialong_automl.data.loader import STRING_COLUMNS
 from dialong_automl.features.wide import (
+    _REPRESENTATION_LEAKAGE_COLUMNS,
     CATEGORICAL_FEATURES,
     NUMERIC_FEATURES,
-    _REPRESENTATION_LEAKAGE_COLUMNS,
 )
 from dialong_automl.models.base import REPRESENTATION_SEQUENCE, REPRESENTATION_WIDE
 
@@ -265,6 +265,72 @@ def _load_sequence_artifacts(artifact_dir: Path) -> tuple[Any, Any, dict[str, An
 
 
 # ---------------------------------------------------------------------------
+# Reliability (Phase 14E)
+# ---------------------------------------------------------------------------
+
+RELIABILITY_NOTE = (
+    "Reliability describes how much to trust this prediction compared with other predictions "
+    "from the same synthetic demonstration model. It is not clinical evidence."
+)
+
+
+def _reliability(artifact_dir: Path, obs_df: pd.DataFrame, proba: float, threshold: float,
+                 max_visits: int, score_member) -> dict[str, Any] | None:
+    """Reliability object, or None when the artifacts predate Phase 14E."""
+    manifest_path = artifact_dir / "reliability.json"
+    if not manifest_path.exists():
+        return None
+    from dialong_automl.features.wide import WideRepresentationBuilder
+    from dialong_automl.reliability.calibration import calibrator_from_dict
+    from dialong_automl.reliability.conformal import MondrianConformal, set_labels
+    from dialong_automl.reliability.ensemble import RANGE_NOTE, variability_range
+    from dialong_automl.reliability.ood import MahalanobisOOD
+    from dialong_automl.reliability.quality import quality_flags
+    from dialong_automl.reliability.report import build_report
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        def load(key: str) -> dict[str, Any]:
+            return json.loads((artifact_dir / manifest[key]).read_text(encoding="utf-8"))
+
+        cal = calibrator_from_dict(load("calibration"))
+        conf = MondrianConformal.from_dict(load("conformal"))
+        ood = MahalanobisOOD.from_dict(load("ood"))
+    except (OSError, KeyError, ValueError) as exc:
+        raise PredictionError(f"Reliability artifacts are incomplete or corrupt: {exc}") from exc
+
+    p_cal = float(cal.transform(np.array([proba]))[0])
+    has0, has1 = conf.predict_sets(np.array([p_cal]))
+    pset = set_labels(has0, has1)[0]
+    wide = WideRepresentationBuilder(max_waves=max_visits).build(obs_df).X
+    ood_pct = float(ood.percentile(wide)[0])
+    ood_cat = ood.category(wide)[0]
+    low = high = None
+    if len(manifest.get("members") or []) >= 2:
+        mp = [score_member(artifact_dir / f) for f in manifest["members"]]
+        r = variability_range(cal.transform(np.array(mp))[:, None])
+        low, high = float(r["low"][0]), float(r["high"][0])
+    cut = manifest.get("width_cutoffs")
+    flags = quality_flags(obs_df, max_visits, tuple(manifest.get("hba1c_age_days", (180, 365))))
+    rep = build_report(flags, pset, low, high, tuple(cut) if cut else None, ood_cat, ood_pct)
+    out = rep.to_dict()
+    out.update({
+        "calibrated_probability": p_cal,
+        "calibrated_threshold": float(cal.transform(np.array([threshold]))[0]),
+        "ood_category": ood_cat,
+        "conformal_coverage_target": 1 - conf.alpha,
+        "range_note": RANGE_NOTE,
+        "method": {"calibration": cal.method, "conformal": "class_conditional",
+                   "members": len(manifest.get("members") or []),
+                   "fit_partition": manifest.get("fit_partition"),
+                   "optimistic": bool(manifest.get("optimistic", True))},
+        "note": RELIABILITY_NOTE,
+    })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Prediction core
 # ---------------------------------------------------------------------------
 
@@ -341,6 +407,17 @@ def predict_from_artifacts(
         )
 
     prediction = int(proba >= threshold)
+
+    def score_member(path: Path) -> float:
+        if representation == REPRESENTATION_SEQUENCE:
+            from dialong_automl.models.gru import GRUModel
+            m = GRUModel.load(path)
+            return float(np.asarray(m.predict_proba_with_mask(X, seq.mask)).ravel()[0])
+        from dialong_automl.models import build_model
+        m = type(build_model(model_name)).load(path)
+        return float(np.asarray(m.predict_proba(X)).ravel()[0])
+
+    reliability = _reliability(artifact_dir, obs_df, proba, threshold, max_waves, score_member)
     return {
         "patient_id": patient_id,
         "probability": proba,
@@ -349,6 +426,7 @@ def predict_from_artifacts(
         "model": model_name,
         "representation": representation,
         "n_visits": len(visits),
+        "reliability": reliability,
         "disclaimer": (
             "Synthetic demonstration model. Prediction is not clinical "
             "evidence and must not be used for medical decisions."

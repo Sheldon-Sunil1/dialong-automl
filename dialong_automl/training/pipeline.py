@@ -75,6 +75,9 @@ from dialong_automl.evaluation.metrics import evaluate
 from dialong_automl.evaluation.threshold import select_decision_threshold
 from dialong_automl.reliability.calibration import calibration_summary, make_calibrator
 from dialong_automl.reliability.conformal import MondrianConformal, coverage_summary
+from dialong_automl.reliability.ensemble import member_subsamples, variability_range
+from dialong_automl.reliability.ood import MahalanobisOOD
+from dialong_automl.reliability.report import width_cutoffs
 from dialong_automl.features.preprocessing import SequencePreprocessor, WidePreprocessor
 from dialong_automl.features.sequence import SequenceRepresentationBuilder
 from dialong_automl.features.wide import WideRepresentationBuilder
@@ -898,6 +901,41 @@ class TrainingPipeline:
 
         retrain_seconds = time.perf_counter() - t_retrain_start
 
+        # Phase 14E: reliability components for the SERVED model, fitted on
+        # train+validation only (the test set is still untouched).
+        rel_cfg = self.cfg.reliability
+        members: list[Any] = []
+        ood_model = None
+        width_cut = None
+        if calibrator is not None:
+            ood_wide = wide_builder.build(train_val_df, train_val_targets).X
+            ood_model = MahalanobisOOD(percentiles=rel_cfg.ood_percentiles).fit(ood_wide)
+            if rel_cfg.ensemble_members:
+                # Members share the final preprocessor (fitted on the same pool)
+                # and are refitted on stratified subsamples of its rows.
+                row_ids = [str(i) for i in range(len(y_trainval))]
+                subs = member_subsamples(row_ids, np.asarray(y_trainval),
+                                         rel_cfg.ensemble_members,
+                                         rel_cfg.ensemble_subsample_fraction,
+                                         seed=self.cfg.training.seed)
+                member_proba = []
+                for sub in subs:
+                    idx = np.array(sorted(int(s) for s in sub))
+                    m = build_model(best_model_name, best_hyperparams)
+                    if best_model_name == "gru":
+                        m.fit(X_trainval[idx], y_trainval[idx], mask=mask_trainval[idx],
+                              lengths=lengths_trainval[idx], X_val=X_internal_val,
+                              y_val=y_internal_val, mask_val=mask_internal_val,
+                              lengths_val=lengths_internal_val)
+                        p = m.predict_proba_with_mask(X_trainval, mask_trainval)
+                    else:
+                        m.fit(X_trainval[idx], y_trainval[idx])
+                        p = m.predict_proba(X_trainval)
+                    members.append(m)
+                    member_proba.append(calibrator.transform(np.asarray(p, dtype=np.float64)))
+                width_cut = width_cutoffs(variability_range(np.vstack(member_proba))["width"],
+                                          rel_cfg.width_percentiles)
+
         # ------------------------------------------------------------------
         # Step 10: Final test evaluation — exactly once
         # ------------------------------------------------------------------
@@ -1077,12 +1115,37 @@ class TrainingPipeline:
         metadata["baselines"] = baselines_record
         metadata["reliability"] = reliability_record
         calibration_path: Path | None = None
+        # A previous run's manifest must never describe this run's model.
+        (artifacts_dir / "reliability.json").unlink(missing_ok=True)
         if calibrator is not None:
             calibration_path = artifacts_dir / "calibration.json"
             with open(calibration_path, "w", encoding="utf-8") as fh:
                 json.dump(reliability_record["calibration"], fh, indent=2)
             with open(artifacts_dir / "conformal.json", "w", encoding="utf-8") as fh:
                 json.dump(reliability_record["conformal"], fh, indent=2)
+            with open(artifacts_dir / "ood.json", "w", encoding="utf-8") as fh:
+                json.dump(ood_model.to_dict(), fh)
+            member_files = []
+            if members:
+                mdir = artifacts_dir / "reliability_members"
+                mdir.mkdir(parents=True, exist_ok=True)
+                ext = "pt" if best_representation == REPRESENTATION_SEQUENCE else "joblib"
+                for i, m in enumerate(members):
+                    m.save(mdir / f"member_{i:02d}.{ext}")
+                    member_files.append(f"reliability_members/member_{i:02d}.{ext}")
+            manifest = {
+                "version": "14e-1", "calibration": "calibration.json",
+                "conformal": "conformal.json", "ood": "ood.json", "members": member_files,
+                "width_cutoffs": list(width_cut) if width_cut else None,
+                "width_cutoffs_from": "member range widths on train+validation patients",
+                "hba1c_age_days": list(rel_cfg.hba1c_age_days),
+                "members_note": "refitted on stratified 80 % subsamples of the final training "
+                                "pool; share the final preprocessor",
+                "fit_partition": CALIBRATION_FIT_PARTITION, "optimistic": True,
+            }
+            with open(artifacts_dir / "reliability.json", "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, indent=2)
+            reliability_record["served_components"] = manifest
         meta_path = artifacts_dir / "model_metadata.json"
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump(metadata, fh, indent=2, default=str)
