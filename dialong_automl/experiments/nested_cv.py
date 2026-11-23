@@ -88,6 +88,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_PREDICTOR = "automl_selected"
 CALIBRATED_PREDICTOR = "automl_calibrated"     # Phase 14B: same model, calibrated output
+SENSITIVITY_ALPHA = 0.20                       # Phase 14F: conformal sensitivity analysis
 ORACLE_PREDICTOR = "oracle_latent_truth"
 PROTOCOL_VERSION = "13e-1"
 DISCLAIMER = ("Synthetic demonstration data only. Not clinical evidence. Does not "
@@ -421,6 +422,9 @@ class NestedCVRunner:
         if calibrator is not None:
             conformal = MondrianConformal(cfg.reliability.conformal_alpha).fit(
                 calibrator.transform(np.asarray(best.val_proba)), y_oof)
+            # Sensitivity analysis only (design decision 3); never used by R6.
+            conformal_sens = MondrianConformal(SENSITIVITY_ALPHA).fit(
+                calibrator.transform(np.asarray(best.val_proba)), y_oof)
 
         # --- baselines: inner OOF -> threshold ---
         horizon = cfg.baselines.b2_horizon_days or cfg.cohort.prediction_horizon_days
@@ -494,6 +498,7 @@ class NestedCVRunner:
             calibrated_threshold = float(calibrator.transform(np.array([sel["threshold"]]))[0])
             cal_scores = calibrator.transform(np.asarray(model_scores))
             has0, has1 = conformal.predict_sets(cal_scores)
+            s0, s1 = conformal_sens.predict_sets(cal_scores)
             rng_ = None
             if members:
                 # Same single read of the test fold; every member scores it.
@@ -512,7 +517,8 @@ class NestedCVRunner:
                 row = {"repeat": repeat, "fold": fold, "patient_id": pid, "y": int(yy),
                        "predictor": CALIBRATED_PREDICTOR, "score": float(s),
                        "threshold": calibrated_threshold, "is_probabilistic": True,
-                       "set_no_onset": bool(has0[i]), "set_onset": bool(has1[i])}
+                       "set_no_onset": bool(has0[i]), "set_onset": bool(has1[i]),
+                       "sens_set_no_onset": bool(s0[i]), "sens_set_onset": bool(s1[i])}
                 if rng_ is not None:
                     row.update(range_low=float(rng_["low"][i]), range_high=float(rng_["high"][i]),
                                range_width=float(rng_["width"][i]))
