@@ -68,6 +68,16 @@ from dialong_automl.features.wide import WideRepresentationBuilder
 from dialong_automl.models import build_model
 from dialong_automl.models.base import REPRESENTATION_SEQUENCE, REPRESENTATION_WIDE
 from dialong_automl.reliability.calibration import make_calibrator
+from dialong_automl.reliability.conformal import MondrianConformal, coverage_summary, set_labels
+from dialong_automl.reliability.ensemble import (
+    RANGE_NOTE,
+    member_subsamples,
+    variability_range,
+    width_summary,
+)
+from dialong_automl.reliability.ood import MahalanobisOOD
+from dialong_automl.reliability.quality import quality_flags_by_patient
+from dialong_automl.reliability.report import build_report, width_cutoffs
 from dialong_automl.training.pipeline import (
     _aligned_labels,
     _assert_same_patient_order,
@@ -406,6 +416,11 @@ class NestedCVRunner:
         if cfg.reliability.enabled:
             calibrator = make_calibrator(cfg.reliability.calibration_method).fit(
                 np.asarray(best.val_proba), y_oof)
+        # --- Phase 14C: conformal thresholds on the calibrated inner OOF ---
+        conformal = None
+        if calibrator is not None:
+            conformal = MondrianConformal(cfg.reliability.conformal_alpha).fit(
+                calibrator.transform(np.asarray(best.val_proba)), y_oof)
 
         # --- baselines: inner OOF -> threshold ---
         horizon = cfg.baselines.b2_horizon_days or cfg.cohort.prediction_horizon_days
@@ -441,6 +456,28 @@ class NestedCVRunner:
         final_baselines = make_baselines()
         for b in final_baselines:
             b.fit(train_part.baseline_inputs())
+        # --- Phase 14C: ensemble members on subsamples of outer-train ---
+        members = []
+        n_members = cfg.reliability.ensemble_members if calibrator is not None else 0
+        if n_members:
+            subs = member_subsamples(outer_ids, targets.loc[outer_ids].to_numpy(), n_members,
+                                     cfg.reliability.ensemble_subsample_fraction,
+                                     seed=cfg.training.seed + 1000 * repeat + fold)
+            for sub_ids in subs:
+                s_obs, s_t = _subset(obs, targets, sub_ids)
+                members.append(self._fit_final(best.model_name, best.representation,
+                                               best.hyperparams, s_obs, s_t, sub_ids))
+        # --- Phase 14D: OOD reference and width cut-offs, outer-train only ---
+        rel = cfg.reliability
+        ood = MahalanobisOOD(percentiles=rel.ood_percentiles).fit(train_part.wide_raw) \
+            if calibrator is not None else None
+        cutoffs = None
+        if members:
+            # Label-free: members' range widths on the outer-training patients.
+            tr_mp = [calibrator.transform(np.asarray(m(outer_ids, obs, targets)[1]))
+                     for m in members]
+            cutoffs = width_cutoffs(variability_range(np.vstack(tr_mp))["width"],
+                                    rel.width_percentiles)
 
         # --- the ONLY read of the outer test fold ---
         test_ids, test_obs, test_targets = test.release()
@@ -456,10 +493,37 @@ class NestedCVRunner:
             # mapped through the (monotone) calibrator for display and metrics.
             calibrated_threshold = float(calibrator.transform(np.array([sel["threshold"]]))[0])
             cal_scores = calibrator.transform(np.asarray(model_scores))
-            for pid, yy, s in zip(test_part.ids, test_part.y, cal_scores):
-                rows.append({"repeat": repeat, "fold": fold, "patient_id": pid, "y": int(yy),
-                             "predictor": CALIBRATED_PREDICTOR, "score": float(s),
-                             "threshold": calibrated_threshold, "is_probabilistic": True})
+            has0, has1 = conformal.predict_sets(cal_scores)
+            rng_ = None
+            if members:
+                # Same single read of the test fold; every member scores it.
+                mp = []
+                for m in members:
+                    m_part, m_scores = m(test_ids, test_obs, test_targets)
+                    if list(m_part.ids) != list(test_part.ids):
+                        raise RuntimeError("Ensemble member scored patients in a different order.")
+                    mp.append(calibrator.transform(np.asarray(m_scores)))
+                rng_ = variability_range(np.vstack(mp))
+            qflags = quality_flags_by_patient(test_part.obs, self.max_visits, rel.hba1c_age_days)
+            ood_pct = ood.percentile(test_part.wide_raw)
+            ood_cat = ood.category(test_part.wide_raw)
+            labels = set_labels(has0, has1)
+            for i, (pid, yy, s) in enumerate(zip(test_part.ids, test_part.y, cal_scores)):
+                row = {"repeat": repeat, "fold": fold, "patient_id": pid, "y": int(yy),
+                       "predictor": CALIBRATED_PREDICTOR, "score": float(s),
+                       "threshold": calibrated_threshold, "is_probabilistic": True,
+                       "set_no_onset": bool(has0[i]), "set_onset": bool(has1[i])}
+                if rng_ is not None:
+                    row.update(range_low=float(rng_["low"][i]), range_high=float(rng_["high"][i]),
+                               range_width=float(rng_["width"][i]))
+                flags = qflags.get(str(pid), [])
+                rep = build_report(flags, labels[i],
+                                   row.get("range_low"), row.get("range_high"), cutoffs,
+                                   ood_cat[i], float(ood_pct[i]))
+                row.update(ood_percentile=float(ood_pct[i]), ood_category=ood_cat[i],
+                           flags=";".join(f.code for f in rep.flags),
+                           reliability_level=rep.level)
+                rows.append(row)
         for b in final_baselines:
             scores = b.predict_scores(test_part.baseline_inputs())
             thr = float(b_thresholds[b.name]["threshold"])
@@ -484,6 +548,20 @@ class NestedCVRunner:
                 "fit_partition": "inner-CV out-of-fold probabilities (outer-training patients)",
                 "calibrated_threshold": calibrated_threshold,
             }),
+            "conformal": (None if conformal is None else {
+                **conformal.to_dict(),
+                "fit_partition": "calibrated inner-CV out-of-fold probabilities "
+                                 "(same patients as the calibrator; approximate guarantee)",
+            }),
+            "ensemble": {"members": len(members),
+                         "subsample_fraction": cfg.reliability.ensemble_subsample_fraction,
+                         "width_cutoffs": cutoffs,
+                         "width_cutoffs_from": "member range widths on outer-training patients "
+                                               "(label-free; members saw ~80 % of them)",
+                         "note": RANGE_NOTE} if members else None,
+            "ood": None if ood is None else {"n_fit": ood.n_fit, "cutoffs": ood.cutoffs,
+                                             "percentiles": list(ood.percentiles),
+                                             "fit_partition": "outer-training patients"},
         }
         return record, rows
 
@@ -562,6 +640,7 @@ class NestedCVRunner:
         split_hash = hashlib.sha256(json.dumps(assignment, sort_keys=True).encode()).hexdigest()
         result = self._record(summary, comparisons, folds, generation_metadata, cohort_audit,
                               split_hash, ids, targets, started)
+        result.metadata["reliability"] = reliability_summary(pred, self.cfg.reliability)
         run_dir = (Path(self.cfg.paths.outputs_dir) / self.ncv.output_subdir
                    / (run_name or result.run_id))
         out = NestedCVResult(run_id=result.run_id, run_dir=run_dir, summary=summary,
@@ -662,12 +741,64 @@ class NestedCVRunner:
         pd.DataFrame(out.comparisons).to_csv(out.run_dir / "comparisons.csv", index=False)
         with (out.run_dir / "folds.json").open("w", encoding="utf-8") as fh:
             json.dump(out.folds, fh, indent=2, default=str)
+        rel = out.run_result.metadata.get("reliability")
+        if rel is not None:
+            with (out.run_dir / "reliability_summary.json").open("w", encoding="utf-8") as fh:
+                json.dump(rel, fh, indent=2)
         with (out.run_dir / "resolved_config.json").open("w", encoding="utf-8") as fh:
             json.dump(self.cfg.model_dump(mode="json"), fh, indent=2, default=str)
         if gen_meta:
             with (out.run_dir / "generation_metadata.json").open("w", encoding="utf-8") as fh:
                 json.dump(gen_meta, fh, indent=2, default=str)
         logger.info("Nested CV run written to %s", out.run_dir)
+
+
+def reliability_summary(pred: pd.DataFrame, rel_cfg) -> dict[str, Any] | None:
+    """Conformal coverage and variability-range widths on the outer test folds.
+
+    Coverage is computed per repeat on all patients (each scored once) and
+    averaged over repeats; the minimum per-fold coverage is also reported.
+    """
+    cal = pred[pred.predictor == CALIBRATED_PREDICTOR]
+    if cal.empty or "set_onset" not in cal.columns:
+        return None
+    per_rep = [coverage_summary(g["y"], g["set_no_onset"].astype(bool), g["set_onset"].astype(bool))
+               for _, g in cal.groupby("repeat")]
+    keys = [k for k in per_rep[0] if k.startswith(("coverage", "share_", "mean_set"))]
+    out: dict[str, Any] = {
+        "alpha": rel_cfg.conformal_alpha, "target_coverage": 1 - rel_cfg.conformal_alpha,
+        "guarantee": "approximate in nested CV (calibration scores from inner-fold models)",
+        "conformal": {k: float(np.mean([r[k] for r in per_rep])) for k in keys},
+        "n_patients": per_rep[0]["n"],
+    }
+    fold_cov = []
+    for _, g in cal.groupby(["repeat", "fold"]):
+        s = coverage_summary(g["y"], g["set_no_onset"].astype(bool), g["set_onset"].astype(bool))
+        fold_cov.append(s)
+    for c in ("no_onset", "onset"):
+        vals = [f[f"coverage_{c}"] for f in fold_cov if f[f"coverage_{c}"] is not None]
+        out["conformal"][f"min_fold_coverage_{c}"] = float(min(vals)) if vals else None
+    if "reliability_level" in cal.columns:
+        # Descriptive only; the within-risk-stratum evaluation is Phase 14F.
+        lv = {}
+        for level, g in cal.groupby("reliability_level"):
+            err = (g["score"] >= g["threshold"]).astype(int) != g["y"]
+            lv[level] = {"share": float(len(g) / len(cal)),
+                         "brier": float(np.mean((g["score"] - g["y"]) ** 2)),
+                         "misclassification": float(err.mean()),
+                         "onset_rate": float(g["y"].mean())}
+        out["levels"] = lv
+        codes = cal["flags"].fillna("").str.split(";").explode()
+        out["flag_shares"] = {k: float(v / len(cal))
+                              for k, v in codes[codes != ""].value_counts().items()}
+    if "range_width" in cal.columns and cal["range_width"].notna().all():
+        out["ensemble"] = {"members": rel_cfg.ensemble_members,
+                           "width": width_summary(cal["range_width"].to_numpy()),
+                           "share_point_inside_range": float(
+                               ((cal["score"] >= cal["range_low"])
+                                & (cal["score"] <= cal["range_high"])).mean()),
+                           "note": RANGE_NOTE}
+    return out
 
 
 def timestamp() -> str:

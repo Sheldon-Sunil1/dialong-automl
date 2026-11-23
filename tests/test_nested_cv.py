@@ -41,6 +41,7 @@ def _cfg(tmp_path, scenario="v2_standard", n=500, repeats=2, trials=2) -> AppCon
     cfg.cohort.require_outcome_measurement = scenario == "v2_standard"
     cfg.training.threshold_strategy = "validation_f1"
     cfg.model.enabled_models = ["logistic_regression", "lightgbm"]
+    cfg.reliability.ensemble_members = 2        # keep tests fast; 10 in research configs
     cfg.nested_cv = NestedCVConfig(scenario=scenario, n_patients=n, dataset_seed=5, oracle_draws=6,
                                    repeats=repeats, outer_folds=3, inner_folds=2, n_trials=trials,
                                    bootstrap_resamples=60, bootstrap_seed=1)

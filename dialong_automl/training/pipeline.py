@@ -74,6 +74,7 @@ from dialong_automl.data.splitter import PatientSplitter, SplitConfig
 from dialong_automl.evaluation.metrics import evaluate
 from dialong_automl.evaluation.threshold import select_decision_threshold
 from dialong_automl.reliability.calibration import calibration_summary, make_calibrator
+from dialong_automl.reliability.conformal import MondrianConformal, coverage_summary
 from dialong_automl.features.preprocessing import SequencePreprocessor, WidePreprocessor
 from dialong_automl.features.sequence import SequenceRepresentationBuilder
 from dialong_automl.features.wide import WideRepresentationBuilder
@@ -709,6 +710,11 @@ class TrainingPipeline:
         if self.cfg.reliability.enabled:
             calibrator = make_calibrator(self.cfg.reliability.calibration_method).fit(
                 best_val_proba, y_val)
+        # Phase 14C: conformal thresholds on the same calibrated validation predictions.
+        conformal = None
+        if calibrator is not None:
+            conformal = MondrianConformal(self.cfg.reliability.conformal_alpha).fit(
+                calibrator.transform(np.asarray(best_val_proba, dtype=np.float64)), y_val)
 
         logger.info(
             "  Best: %s (val_auroc=%.4f)", best_model_name, best_val_auroc or 0.0
@@ -930,6 +936,10 @@ class TrainingPipeline:
                 },
                 "test_calibration_raw": calibration_summary(y_test, test_proba),
                 "test_calibration_calibrated": calibration_summary(y_test, test_proba_cal),
+                "conformal": {**conformal.to_dict(), "fit_partition": CALIBRATION_FIT_PARTITION,
+                              "optimistic": True},
+                "test_conformal_coverage": coverage_summary(y_test, *conformal.predict_sets(
+                    test_proba_cal)),
             }
 
         # Final retrained model on the validation patients. These patients were
@@ -1071,6 +1081,8 @@ class TrainingPipeline:
             calibration_path = artifacts_dir / "calibration.json"
             with open(calibration_path, "w", encoding="utf-8") as fh:
                 json.dump(reliability_record["calibration"], fh, indent=2)
+            with open(artifacts_dir / "conformal.json", "w", encoding="utf-8") as fh:
+                json.dump(reliability_record["conformal"], fh, indent=2)
         meta_path = artifacts_dir / "model_metadata.json"
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump(metadata, fh, indent=2, default=str)

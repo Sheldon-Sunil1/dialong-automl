@@ -510,6 +510,41 @@ class ReliabilityConfig(BaseModel):
     calibration_method: str = Field(
         "platt", description="Post-hoc calibration: 'platt' (default), 'isotonic' or 'none'."
     )
+    conformal_alpha: float = Field(
+        0.10, gt=0, lt=1,
+        description="Miscoverage of the class-conditional conformal sets (0.10 = 90 % sets).",
+    )
+    ensemble_members: int = Field(
+        10, ge=0, description="Refitted members for the model-variability range "
+                              "(nested CV only in 14C; 0 disables, otherwise >= 2).",
+    )
+    ensemble_subsample_fraction: float = Field(
+        0.8, gt=0, le=1, description="Share of training patients per member (no replacement).",
+    )
+
+    ood_percentiles: tuple[float, float] = Field(
+        (95.0, 99.0), description="OOD distance percentiles of training patients: unusual, far.")
+    hba1c_age_days: tuple[int, int] = Field(
+        (180, 365), description="Days since the last HbA1c for the 'old' and 'stale' flags.")
+    width_percentiles: tuple[float, float] = Field(
+        (80.0, 95.0), description="Variability-range width percentiles: Moderate, Low.")
+
+    @field_validator("ood_percentiles", "hba1c_age_days", "width_percentiles")
+    @classmethod
+    def _validate_pair(cls, v):
+        lo, hi = v
+        if not 0 < lo < hi:
+            raise ValueError("reliability cut-off pairs must satisfy 0 < low < high")
+        if isinstance(lo, float) and hi >= 100:
+            raise ValueError("percentile cut-offs must be below 100")
+        return v
+
+    @field_validator("ensemble_members")
+    @classmethod
+    def _validate_members(cls, v: int) -> int:
+        if v == 1:
+            raise ValueError("reliability.ensemble_members must be 0 or >= 2")
+        return v
 
     @field_validator("calibration_method")
     @classmethod
