@@ -1,0 +1,102 @@
+# =============================================================================
+# DiaLong-AutoML — research_v4: nested-CV evaluation on synthetic scenario v2
+# Phase 13E protocol (scripts/run_nested_cv.py). Phase 13D data (v2_standard).
+#
+# Differences from research_experiment_v3:
+#   * data come from the frozen v2_standard scenario, generated in memory
+#     (nothing under data/ is written or read);
+#   * outcome must be measured in the horizon (unascertained patients excluded);
+#   * threshold chosen by validation_f1 on inner-CV out-of-fold predictions;
+#   * repeated nested patient-level CV with bootstrap CIs and baselines B0-B3.
+#
+# Runs are written to outputs/research_v4/nested_cv/<run_id>/ and never
+# overwrite earlier runs. Optuna is a third-party library; studies are in-memory.
+#
+# DISCLAIMER: Synthetic demonstration data only. NOT clinical evidence.
+# =============================================================================
+
+project_name: "DiaLong-AutoML"
+version: "0.1.0"
+description: "Research v4 — nested-CV evaluation on synthetic scenario v2_standard"
+
+paths:
+  data_dir: "data"
+  artifacts_dir: "artifacts/research_v4"
+  outputs_dir: "outputs/research_v4"
+  logs_dir: "logs"
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  log_to_file: false
+
+reproducibility:
+  seed: 42
+  deterministic_torch: false   # GRU runs are not bit-reproducible on CPU with this off
+  benchmark_cudnn: false
+
+cohort:
+  mode: "future_outcome"
+  min_observation_visits: 3
+  max_observation_visits: 4
+  prediction_horizon_days: 365          # must equal V2Params.label_horizon_days
+  diabetes_onset_hba1c_threshold: 6.5
+  exclude_known_diabetes_at_baseline: true
+  require_followup_after_cutoff: true
+  require_outcome_measurement: true     # Phase 13D: do not label unmeasured outcomes 0
+
+split:
+  train_size: 0.70
+  validation_size: 0.15
+  test_size: 0.15
+  random_seed: 42
+  stratify: true
+  chronological: false
+
+training:
+  seed: 42
+  threshold: 0.5
+  threshold_strategy: "validation_f1"   # inner-CV out-of-fold predictions only
+  max_iter_sklearn: 2000
+
+gru:
+  epochs: 30
+  patience: 5
+
+model:
+  enabled_models:
+    - logistic_regression
+    - random_forest
+    - xgboost
+    - lightgbm
+    - gru
+
+optuna:
+  n_trials: 20            # ignored by the nested runner (uses nested_cv.n_trials)
+  direction: "maximize"
+  metric: "roc_auc"
+  pruner: "MedianPruner"  # no intermediate reports in nested CV, so it never prunes
+  sampler: "TPESampler"
+  seed: 42
+  n_jobs: 1
+  storage: null
+  study_name: "dialong_research_v4"
+
+baselines:
+  enabled: true
+  b2_horizon_days: null
+  b3_c: 1.0
+
+nested_cv:
+  scenario: "v2_standard"
+  n_patients: 5000
+  dataset_seed: 42
+  oracle_draws: 32
+  repeats: 2
+  outer_folds: 5
+  inner_folds: 3
+  n_trials: 20
+  bootstrap_resamples: 1000
+  bootstrap_seed: 2026
+  primary_comparator: "b3_logreg_all"
+  output_subdir: "nested_cv"

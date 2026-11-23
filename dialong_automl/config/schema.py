@@ -376,6 +376,13 @@ class CohortBuilderConfig(BaseModel):
         True,
         description="Exclude patients with no future visits beyond the cutoff.",
     )
+    require_outcome_measurement: bool = Field(
+        False,
+        description=(
+            "Phase 13D: exclude patients whose horizon has no measured HbA1c and no "
+            "recorded diagnosis (outcome unascertained) instead of labelling them 0."
+        ),
+    )
 
     @field_validator("mode")
     @classmethod
@@ -487,6 +494,90 @@ class BaselinesConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Prediction reliability (Phase 14; see docs/research/phase_14a_reliability_design.md)
+# ---------------------------------------------------------------------------
+
+
+class ReliabilityConfig(BaseModel):
+    """Reliability layer for the served / evaluated model.
+
+    14B implements post-hoc calibration only. Further fields (ensemble range,
+    conformal sets, quality and OOD flags) are added by the phase that
+    implements them, so no field here is ever ignored.
+    """
+
+    enabled: bool = Field(True, description="Fit and report the reliability layer.")
+    calibration_method: str = Field(
+        "platt", description="Post-hoc calibration: 'platt' (default), 'isotonic' or 'none'."
+    )
+
+    @field_validator("calibration_method")
+    @classmethod
+    def _validate_method(cls, v: str) -> str:
+        allowed = ("platt", "isotonic", "none")
+        if v not in allowed:
+            raise ValueError(f"reliability.calibration_method must be one of {allowed}, got {v!r}")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Unified evaluation runner (Phase 13E)
+# ---------------------------------------------------------------------------
+
+
+class NestedCVConfig(BaseModel):
+    """Repeated, nested, patient-level cross-validation protocol (Phase 13E).
+
+    Used only by ``dialong_automl.experiments.nested_cv`` /
+    ``scripts/run_nested_cv.py``; the single-split ``TrainingPipeline`` ignores it.
+    """
+
+    scenario: str = Field("v2_standard", description="Synthetic scenario to generate.")
+    n_patients: int = Field(5000, description="Patients generated before cohort exclusions.")
+    dataset_seed: int = Field(42, description="Seed of the synthetic scenario.")
+    oracle_draws: int = Field(32, description="Monte Carlo draws for the v2 latent-state oracle.")
+    repeats: int = Field(2, description="Independent repetitions of the outer K-fold split.")
+    outer_folds: int = Field(5, description="Outer stratified patient-level folds (test folds).")
+    inner_folds: int = Field(3, description="Inner folds for selection, threshold and baselines.")
+    n_trials: int = Field(20, description="Optuna trials per outer fold (inner-CV objective).")
+    bootstrap_resamples: int = Field(1000, description="Patient-level bootstrap resamples.")
+    bootstrap_seed: int = Field(2026, description="Seed of the bootstrap.")
+    primary_comparator: str = Field(
+        "b3_logreg_all", description="Baseline for the pre-specified primary comparison."
+    )
+    output_subdir: str = Field("nested_cv", description="Run folders go under outputs_dir/<this>.")
+
+    @field_validator("scenario")
+    @classmethod
+    def _validate_scenario(cls, v: str) -> str:
+        allowed = ("legacy_v1", "v2_standard")
+        if v not in allowed:
+            raise ValueError(f"nested_cv.scenario must be one of {allowed}, got {v!r}")
+        return v
+
+    @field_validator("outer_folds", "inner_folds")
+    @classmethod
+    def _validate_folds(cls, v: int) -> int:
+        if v < 2:
+            raise ValueError(f"fold counts must be >= 2, got {v}")
+        return v
+
+    @field_validator("repeats", "n_trials", "n_patients")
+    @classmethod
+    def _validate_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+    @field_validator("bootstrap_resamples", "oracle_draws")
+    @classmethod
+    def _validate_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"must be >= 0, got {v}")
+        return v
+
+
+# ---------------------------------------------------------------------------
 # Database (Phase 10 — patient/visit persistence)
 # ---------------------------------------------------------------------------
 
@@ -536,3 +627,7 @@ class AppConfig(BaseModel):
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     # Phase 13C: reference baselines (not part of the Optuna study identity).
     baselines: BaselinesConfig = Field(default_factory=BaselinesConfig)
+    # Phase 13E: nested-CV evaluation protocol (not part of the Optuna study identity).
+    nested_cv: NestedCVConfig = Field(default_factory=NestedCVConfig)
+    # Phase 14: reliability layer (not part of the Optuna study identity).
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)

@@ -166,6 +166,12 @@ class CohortConfig:
     require_followup_after_cutoff:
         When ``True``, patients with no future visits beyond the cutoff are
         excluded (outcome cannot be determined).
+    require_outcome_measurement:
+        When ``True``, a patient whose horizon visits contain neither a
+        measured HbA1c nor ``diabetes_diagnosis == 1`` is excluded as
+        "outcome unascertained" instead of being labelled 0 (Phase 13D;
+        default ``False`` preserves the original behaviour, in which a
+        missing future HbA1c counts as no onset).
     target_inconsistency_as_error:
         For pre-labeled mode: whether inconsistent targets raise an error
         (``True``) or just emit a warning (``False``).
@@ -179,6 +185,10 @@ class CohortConfig:
     exclude_known_diabetes_at_baseline: bool = True
     require_followup_after_cutoff: bool = True
     target_inconsistency_as_error: bool = True
+    # Phase 13D: when True, a patient whose horizon contains no measured HbA1c
+    # and no recorded diagnosis is EXCLUDED (outcome unascertained) instead of
+    # being labelled 0. Default False keeps the original behaviour.
+    require_outcome_measurement: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +220,10 @@ class CohortAudit:
     diabetes_onset_hba1c_threshold: float
     exclude_known_diabetes_at_baseline: bool
 
+    # Phase 13D: unascertained-outcome exclusion (0 unless enabled).
+    excluded_unmeasured_outcome: int = 0
+    require_outcome_measurement: bool = False
+
     # Per-patient diagnostics
     observation_visit_counts: dict[str, int] = field(default_factory=dict)
     cutoff_dates: dict[str, str] = field(default_factory=dict)
@@ -234,6 +248,8 @@ class CohortAudit:
             "prediction_horizon_days": self.prediction_horizon_days,
             "diabetes_onset_hba1c_threshold": self.diabetes_onset_hba1c_threshold,
             "exclude_known_diabetes_at_baseline": self.exclude_known_diabetes_at_baseline,
+            "excluded_unmeasured_outcome": self.excluded_unmeasured_outcome,
+            "require_outcome_measurement": self.require_outcome_measurement,
             "target_construction_criteria": self.target_construction_criteria,
         }
 
@@ -519,6 +535,7 @@ class CohortBuilder:
         n_excluded_visits = 0
         n_excluded_followup = 0
         n_excluded_inconsistent = 0
+        n_excluded_unmeasured = 0
 
         obs_rows: list[pd.DataFrame] = []
         targets: dict[str, int] = {}
@@ -622,6 +639,12 @@ class CohortBuilder:
                 n_excluded_followup += 1
                 continue
 
+            if self.cfg.require_outcome_measurement and not _outcome_ascertained(
+                future_in_horizon
+            ):
+                n_excluded_unmeasured += 1
+                continue
+
             patient_target = self._derive_future_target(future_in_horizon)
 
             # --- CRITICAL: strip leakage columns from observation data ---
@@ -681,6 +704,8 @@ class CohortBuilder:
             prediction_horizon_days=self.cfg.prediction_horizon_days,
             diabetes_onset_hba1c_threshold=self.cfg.diabetes_onset_hba1c_threshold,
             exclude_known_diabetes_at_baseline=self.cfg.exclude_known_diabetes_at_baseline,
+            excluded_unmeasured_outcome=n_excluded_unmeasured,
+            require_outcome_measurement=self.cfg.require_outcome_measurement,
             observation_visit_counts=obs_visit_counts,
             cutoff_dates=cutoff_dates_dict,
             target_construction_criteria=(
@@ -736,6 +761,17 @@ class CohortBuilder:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _outcome_ascertained(future_in_horizon: pd.DataFrame) -> bool:
+    """True when the horizon has a measured HbA1c or a recorded diagnosis."""
+    measured = False
+    if "hba1c" in future_in_horizon.columns:
+        measured = bool(pd.to_numeric(future_in_horizon["hba1c"], errors="coerce").notna().any())
+    diagnosed = False
+    if "diabetes_diagnosis" in future_in_horizon.columns:
+        diagnosed = bool((future_in_horizon["diabetes_diagnosis"] == 1).any())
+    return measured or diagnosed
+
 
 def _require_columns(df: pd.DataFrame, columns: list[str]) -> None:
     missing = [c for c in columns if c not in df.columns]

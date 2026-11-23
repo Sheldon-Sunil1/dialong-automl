@@ -73,6 +73,7 @@ from dialong_automl.data.loader import load_longitudinal_csv
 from dialong_automl.data.splitter import PatientSplitter, SplitConfig
 from dialong_automl.evaluation.metrics import evaluate
 from dialong_automl.evaluation.threshold import select_decision_threshold
+from dialong_automl.reliability.calibration import calibration_summary, make_calibrator
 from dialong_automl.features.preprocessing import SequencePreprocessor, WidePreprocessor
 from dialong_automl.features.sequence import SequenceRepresentationBuilder
 from dialong_automl.features.wide import WideRepresentationBuilder
@@ -145,6 +146,9 @@ class PipelineResult:
     # Phase 13C reference baselines (fixed comparators, never selectable).
     # {"enabled": False} when disabled; otherwise BaselineRunner.to_dict().
     baselines: dict[str, Any] = field(default_factory=dict)
+
+    # Phase 14B reliability layer: {"enabled": False} or calibration details.
+    reliability: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = [
@@ -337,6 +341,14 @@ VALIDATION_METRICS_SOURCE = (
     "are therefore optimistically biased and are NOT an unbiased estimate of "
     "generalisation performance; only test_metrics are untouched by selection."
 )
+CALIBRATION_FIT_PARTITION = (
+    "validation split: best-trial model fitted on train only (before final retrain)"
+)
+CALIBRATION_NOTE = (
+    "Single-split calibration is fitted on the validation split, which also drives model "
+    "and threshold selection, so it is optimistic. The nested-CV runner (inner out-of-fold "
+    "fit, outer-fold evaluation) is the reference evaluation of calibration."
+)
 LIMITATIONS_VALIDATION = (
     "Validation split used for model selection, GRU early stopping and (optionally) "
     "threshold selection; validation metrics are not unbiased estimates of "
@@ -468,6 +480,7 @@ class TrainingPipeline:
             diabetes_onset_hba1c_threshold=self.cfg.cohort.diabetes_onset_hba1c_threshold,
             exclude_known_diabetes_at_baseline=self.cfg.cohort.exclude_known_diabetes_at_baseline,
             require_followup_after_cutoff=self.cfg.cohort.require_followup_after_cutoff,
+            require_outcome_measurement=self.cfg.cohort.require_outcome_measurement,
         )
         cohort = CohortBuilder(cohort_cfg).build(full_df)
         obs = cohort.observation_data
@@ -690,6 +703,13 @@ class TrainingPipeline:
         # TRAIN split only and has never seen these validation patients.
         val_metrics = evaluate(y_val, best_val_proba, threshold=threshold, prefix="val_")
 
+        # Phase 14B: calibrator fitted on the SAME validation predictions as the
+        # threshold (best trial, train-only model, before the retrain).
+        calibrator = None
+        if self.cfg.reliability.enabled:
+            calibrator = make_calibrator(self.cfg.reliability.calibration_method).fit(
+                best_val_proba, y_val)
+
         logger.info(
             "  Best: %s (val_auroc=%.4f)", best_model_name, best_val_auroc or 0.0
         )
@@ -890,6 +910,28 @@ class TrainingPipeline:
 
         test_metrics = evaluate(y_test, test_proba, threshold=threshold, prefix="test_")
 
+        # Phase 14B: calibration of the final model's test probabilities, raw vs
+        # calibrated (the calibrator was frozen before the test set was touched).
+        reliability_record: dict[str, Any] = {"enabled": False}
+        if calibrator is not None:
+            test_proba_cal = calibrator.transform(np.asarray(test_proba, dtype=np.float64))
+            reliability_record = {
+                "enabled": True,
+                "calibration": {
+                    **calibrator.to_dict(),
+                    "fit_partition": CALIBRATION_FIT_PARTITION,
+                    "applied_to": "final retrained model (probabilities may be distributed "
+                                  "differently from the pre-retrain model)",
+                    "calibrated_threshold": float(
+                        calibrator.transform(np.array([threshold]))[0]),
+                    "decision_rule": "prediction = raw probability >= threshold (unchanged)",
+                    "optimistic": True,
+                    "note": CALIBRATION_NOTE,
+                },
+                "test_calibration_raw": calibration_summary(y_test, test_proba),
+                "test_calibration_calibrated": calibration_summary(y_test, test_proba_cal),
+            }
+
         # Final retrained model on the validation patients. These patients were
         # in its training data (fully for wide models; partly for the GRU's
         # internal split), so this is RESUBSTITUTION performance and is reported
@@ -1023,6 +1065,12 @@ class TrainingPipeline:
             ],
         }
         metadata["baselines"] = baselines_record
+        metadata["reliability"] = reliability_record
+        calibration_path: Path | None = None
+        if calibrator is not None:
+            calibration_path = artifacts_dir / "calibration.json"
+            with open(calibration_path, "w", encoding="utf-8") as fh:
+                json.dump(reliability_record["calibration"], fh, indent=2)
         meta_path = artifacts_dir / "model_metadata.json"
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump(metadata, fh, indent=2, default=str)
@@ -1077,6 +1125,7 @@ class TrainingPipeline:
             "inf_time_per_patient_seconds": round(inf_per_patient, 6),
         }
         run_summary["baselines"] = baselines_record
+        run_summary["reliability"] = reliability_record
         summary_path = outputs_dir / "run_summary.json"
         with open(summary_path, "w", encoding="utf-8") as fh:
             json.dump(run_summary, fh, indent=2, default=str)
@@ -1109,6 +1158,8 @@ class TrainingPipeline:
             artifact_paths["failed_trials"] = str(failed_trials_path)
         if comparison_path is not None:
             artifact_paths["baselines_comparison"] = str(comparison_path)
+        if calibration_path is not None:
+            artifact_paths["calibration"] = str(calibration_path)
         if storage:
             artifact_paths["optuna_study_db"] = storage
 
@@ -1140,6 +1191,7 @@ class TrainingPipeline:
             failed_trials=failed_trials,
             retrain_policy=retrain_policy,
             baselines=baselines_record,
+            reliability=reliability_record,
         )
 
         logger.info("Pipeline complete. %s", result.summary())
