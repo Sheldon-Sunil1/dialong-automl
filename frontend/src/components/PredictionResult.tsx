@@ -1,4 +1,5 @@
 import { PredictResponse, SelectedPredictResponse } from "../api/types";
+import { ReliabilityPanel } from "./ReliabilityPanel";
 
 function pct(p: number): string {
   return `${(p * 100).toFixed(1)}%`;
@@ -71,6 +72,14 @@ export function PredictionResult({ result }: { result: PredictResponse }) {
           </div>
         )}
       </dl>
+
+      {result.reliability ? (
+        <ReliabilityPanel reliability={result.reliability} />
+      ) : (
+        <p className="muted small" data-testid="reliability-unavailable">
+          Reliability information is not available for this model version.
+        </p>
+      )}
 
       <p className="muted small">
         This is a model probability, not a confirmed clinical outcome or

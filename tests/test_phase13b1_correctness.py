@@ -53,6 +53,7 @@ def gru_run(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("gru13b1")
     csv = _tiny_full_csv(tmp_path)
     cfg = _gru_cfg(tmp_path, "gru")          # note: split.stratify is False here
+    cfg.reliability.ensemble_members = 0     # members (Phase 14E) would add GRU builds/fits
 
     fits: list[dict] = []
     builds: list[tuple] = []

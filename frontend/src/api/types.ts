@@ -41,7 +41,32 @@ export interface PredictResponse {
   model: string;
   representation: string;
   n_visits: number;
+  /** Phase 14 reliability layer; null/absent for older model artifacts. */
+  reliability?: ReliabilityInfo | null;
   disclaimer: string;
+}
+
+export interface ReliabilityFlag {
+  code: string;
+  severity: "severe" | "moderate" | "info";
+  message: string;
+}
+
+export interface ReliabilityInfo {
+  level: "Low" | "Moderate" | "High";
+  reasons: string[];
+  flags: ReliabilityFlag[];
+  calibrated_probability: number;
+  calibrated_threshold: number;
+  prediction_set: "no_onset" | "onset" | "undecided" | "empty";
+  conformal_coverage_target: number;
+  range_low: number | null;
+  range_high: number | null;
+  range_note: string;
+  ood_percentile: number | null;
+  ood_category: string | null;
+  method: Record<string, unknown>;
+  note: string;
 }
 
 /** A persisted visit (as returned by the patient API). */
